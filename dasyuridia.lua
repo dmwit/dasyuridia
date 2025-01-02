@@ -15,16 +15,26 @@ local MAX_ARRAY_READ_SIZE = 16
 local MAX_ARRAY_WRITE_SIZE = 16
 local MAX_FREEZE_COUNT = 5
 
+local function reply(msg_id, msg_nm, args)
+	io.write('dasyuridia: ' .. msg_id .. ' ' .. msg_nm)
+	if args ~= "" and args ~= nil then
+		io.write(' ' .. args)
+	end
+	io.write('\n')
+	io.flush()
+end
+
 local function exec_read(msg_id, args)
 	if args:match('^[0-9][0-9 ]+$') == nil then
 		io.write('ERR: malformed address list in read arguments: "' .. args .. '"\n')
 		return
 	end
-	io.write(msg_id .. ' read')
+	local result = ''
 	for addr in args:gmatch('%d+') do
-		io.write(' ' .. memory.readbyte(tonumber(addr)))
+		result = result .. ' ' .. memory.readbyte(tonumber(addr))
 	end
-	io.write('\n')
+	-- sub(2) to drop the initial leading space
+	reply(msg_id, 'read', result:sub(2))
 end
 
 local function exec_array_read(msg_id, args)
@@ -39,11 +49,12 @@ local function exec_array_read(msg_id, args)
 		io.write('ERR: read size is too large; only arrays of size up to  ' .. MAX_ARRAY_READ_SIZE .. ' are supported\n')
 		return
 	end
-	io.write(msg_id .. ' array_read')
+	local result = ''
 	for i=1,size do
-		io.write(' ' .. memory.readbyte(base+i-1))
+		result = result .. ' ' .. memory.readbyte(base+i-1)
 	end
-	io.write('\n')
+	-- sub(2) to drop the initial leading space
+	reply(msg_id, 'array_read', result:sub(2))
 end
 
 local function exec_write(msg_id, args)
@@ -54,7 +65,7 @@ local function exec_write(msg_id, args)
 	for addr, val in args:gmatch('(%d+)%s(%d+)') do
 		memory.writebyte(tonumber(addr), tonumber(val))
 	end
-	io.write(msg_id .. ' write\n')
+	reply(msg_id, 'write')
 end
 
 local function exec_array_write(msg_id, args)
@@ -71,7 +82,7 @@ local function exec_array_write(msg_id, args)
 		memory.writebyte(base+offset, tonumber(val))
 		offset = offset + 1
 	end
-	io.write(msg_id .. " array_write\n")
+	reply(msg_id, 'array_write')
 end
 
 local function exec_null(msg_id, args)
@@ -79,7 +90,7 @@ local function exec_null(msg_id, args)
 		io.write('ERR: unexpected arguments to null message: "' .. args .. '"\n')
 		return
 	end
-	io.write(msg_id .. " null\n")
+	reply(msg_id, 'null')
 end
 
 local function exec_version(msg_id, args)
@@ -87,11 +98,11 @@ local function exec_version(msg_id, args)
 		io.write('ERR: unexpected arguments to version message: "' .. args .. '"\n')
 		return
 	end
-	io.write(msg_id .. ' version '
+	reply(msg_id, 'version', ''
 		.. PROTOCOL_VERSION .. ' '
 		.. MAX_ARRAY_READ_SIZE .. ' '
 		.. MAX_ARRAY_WRITE_SIZE .. ' '
-		.. MAX_FREEZE_COUNT .. '\n')
+		.. MAX_FREEZE_COUNT)
 end
 
 local freezes = {size=0}
@@ -213,7 +224,7 @@ local function schedule_freeze(msg_id, args)
 		end
 	end
 
-	io.write(msg_id .. ' freeze ' .. tostring(success) .. '\n')
+	reply(msg_id, 'freeze', tostring(success))
 end
 
 local function exec_freeze()

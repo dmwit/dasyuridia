@@ -1,0 +1,25 @@
+cabal-version:      3.0
+name:               dasyuridia
+version:            0.1.0.0
+synopsis:
+    tools for connecting a Dr. Mario AI to the NES implementation of Dr. Mario
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             Daniel Wagner
+maintainer:         me@dmwit.com
+copyright:          2025 Daniel Wagner
+category:           Game
+build-type:         Simple
+data-files:         dasyuridia.lua
+
+executable dasyuridia
+    main-is:            Main.hs
+    other-modules:      Paths_dasyuridia
+    build-depends:      base ^>=4.19.0.0,
+                        process ^>=1.6,
+    hs-source-dirs:     app
+    ghc-options:        -Wall -Wno-tabs
+    default-language:   GHC2021
+    default-extensions: BlockArguments,
+                        LambdaCase,
+                        ViewPatterns,

@@ -1,8 +1,8 @@
 module Main where
 
 import Control.Concurrent
+import Control.Concurrent.STM
 import Control.Monad
-import Data.Bits
 import Data.Word
 import Paths_dasyuridia
 import System.Environment
@@ -11,6 +11,9 @@ import System.IO
 import System.Process
 import Text.Printf
 import Text.Read
+
+import qualified Data.Array as A
+import qualified Data.Array.IO as MA
 
 main :: IO ()
 main = do
@@ -95,21 +98,65 @@ topLoop q s = do
 	q (Identified 42 QVersion)
 	v <- s
 	unless (v == Identified 42 expectedVersion) $ hPrintf stderr "WARNING: continuing despite unexpected version information %s\n" (show v)
-	-- 2 million years ought to be enough for anybody
-	go 0 (0 :: Word64)
-	where
-	go i clock = do
-		print clock
-		q (Identified i (QRead addrClock))
-		response <- s
-		case response of
-			Identified ((i==) -> True) (SRead clock') -> go (i+1) $ clock + clock8' - clock8 + if clock8' < clock8 then 0x100 else 0
-				where
-				clock8 = clock .&. 0xff
-				clock8' = fromIntegral clock'
-			_ -> hPrintf stderr "FATAL: surprising response %s to query %s\n"
-				(show response)
-				(show (Identified i (QRead addrClock)))
+	rpc <- launchRPCThreads q s
+	let rpcSync = join . rpc
+	stateThread rpcSync
+
+launchRPCThreads :: (Identified Request -> IO ()) -> IO (Identified Response) -> IO (Request -> IO (IO Response))
+launchRPCThreads q s = do
+	chan <- newTChanIO
+	reservations <- MA.newGenArray @MA.IOArray (minBound, maxBound) (const newEmptyMVar) >>= MA.freeze
+	let reqLoop i = do
+	    	(req, mresp) <- atomically (readTChan chan)
+	    	success <- tryPutMVar (reservations A.! i) (putMVar mresp)
+	    	if success
+	    		then q (Identified i req)
+	    		else do
+	    			hPrintf stderr "Tried to reuse outstanding ID %d; perhaps the game has stopped responding? Will try again with another ID after waiting one frame.\n" i
+	    			atomically (unGetTChan chan (req, mresp))
+	    			threadDelay (1000000`quot`60)
+	    	reqLoop (i+1)
+	    respLoop = do
+	    	Identified i resp <- s
+	    	tryTakeMVar (reservations A.! i) >>= \case
+	    		Just act -> act resp
+	    		Nothing -> hPrintf stderr "Ignoring response with unexpected ID %d\n" i
+	    	respLoop
+	_ <- forkIO (reqLoop 0)
+	_ <- forkIO respLoop
+	return \req -> do
+		mresp <- newEmptyMVar
+		atomically (writeTChan chan (req, mresp))
+		return (takeMVar mresp)
+
+clockThread :: (Request -> IO Response) -> IO a
+-- 2 million years ought to be enough for anybody
+clockThread q = go (0 :: Word64) where
+	go clock = print clock >> q req >>= \case
+		SRead clock' -> go (clock + fromIntegral (clock' - fromIntegral clock))
+		resp -> do
+			hPrintf stderr "Ignoring unexpected response %s to request %s\n" (show resp) (show req)
+			go clock
+	req = QRead addrClock
+
+stateThread :: (Request -> IO Response) -> IO a
+stateThread q = unknown where
+	unknown = q reqState >>= \case
+		SRead n -> decodeTopState n
+		resp -> do
+			hPrintf stderr "Ignoring unexpected response %s to request %s\n" (show resp) (show reqState)
+			unknown
+
+	decodeTopState = \case
+		4 -> putStrLn "play" >> play
+		8 -> putStrLn "pregame" >> pregame
+		_ -> putStrLn "don't care" >> don'tCare
+
+	play      = q reqState >>= \case SRead 4 -> play   ; SRead n -> decodeTopState n; _ -> unknown
+	pregame   = q reqState >>= \case SRead 8 -> pregame; SRead n -> decodeTopState n; _ -> unknown
+	don'tCare = q reqState >>= \case SRead 4 -> decodeTopState 4; SRead 8 -> decodeTopState 8; SRead _ -> don'tCare; _ -> unknown
+
+	reqState = QRead addrState
 
 expectedVersion :: Response
 expectedVersion = SVersion
@@ -121,3 +168,6 @@ expectedVersion = SVersion
 
 addrClock :: Word16
 addrClock = 0x43
+
+addrState :: Word16
+addrState = 0x46

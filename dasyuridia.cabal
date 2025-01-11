@@ -16,7 +16,9 @@ executable dasyuridia
     main-is:            Main.hs
     other-modules:      Paths_dasyuridia
     build-depends:      base ^>=4.19.0.0,
+                        array ^>=0.5,
                         process ^>=1.6,
+                        stm ^>=2.5,
     hs-source-dirs:     app
     ghc-options:        -Wall -Wno-tabs
     default-language:   GHC2021

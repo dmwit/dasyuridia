@@ -259,20 +259,13 @@ local function parse_message(line)
 	action_function(msg_id, line:sub(argument_start + 1))
 end
 
+local poll_stdin = require("poll_stdin")
+io.stdin:setvbuf("no")
+
 local INJECTION_POINTS =
 	{ ['5b401f4ca7e1b12af3f29d8fc758dd2f'] = 0xb7e7 -- NTSC original
 	, ['9d961a26f2104e461667c6a1cc57ab21'] = 0xb801 -- NTSC Rev A
 	}
-
-local uv = require("luv")
-local stdin = uv.new_poll(0)
-local again
-stdin:start("r", function(err, events)
-	if err == nil then
-		again = true
-		parse_message(io.read())
-	end
-end)
 local INJECTION_POINT = INJECTION_POINTS[rom.gethash('md5')]
 if INJECTION_POINT == nil then
 	io.write("ERR: unrecognized hash " .. rom.gethash('md5') .. "; expected one of these:\n")
@@ -281,11 +274,6 @@ if INJECTION_POINT == nil then
 	end
 else
 	memory.registerexec(INJECTION_POINT, function()
-		again = true
-		while(again) do
-			again = false
-			uv.run("nowait")
-		end
-		exec_freeze()
+		while poll_stdin() do parse_message(io.read()) end
 	end)
 end

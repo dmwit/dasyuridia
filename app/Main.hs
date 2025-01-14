@@ -100,7 +100,7 @@ topLoop q s = do
 	unless (v == Identified 42 expectedVersion) $ hPrintf stderr "WARNING: continuing despite unexpected version information %s\n" (show v)
 	rpc <- launchRPCThreads q s
 	let rpcSync = join . rpc
-	stateThread rpcSync
+	stateThread rpc
 
 launchRPCThreads :: (Identified Request -> IO ()) -> IO (Identified Response) -> IO (Request -> IO (IO Response))
 launchRPCThreads q s = do
@@ -139,24 +139,30 @@ clockThread q = go (0 :: Word64) where
 			go clock
 	req = QRead addrClock
 
-stateThread :: (Request -> IO Response) -> IO a
-stateThread q = unknown where
-	unknown = q reqState >>= \case
-		SRead n -> decodeTopState n
-		resp -> do
-			hPrintf stderr "Ignoring unexpected response %s to request %s\n" (show resp) (show reqState)
-			unknown
+data State = Unknown | Err | Don'tCare | Pregame | Play deriving (Eq, Ord, Read, Show)
 
-	decodeTopState = \case
-		4 -> putStrLn "play" >> play
-		8 -> putStrLn "pregame" >> pregame
-		_ -> putStrLn "don't care" >> don'tCare
-
-	play      = q reqState >>= \case SRead 4 -> play   ; SRead n -> decodeTopState n; _ -> unknown
-	pregame   = q reqState >>= \case SRead 8 -> pregame; SRead n -> decodeTopState n; _ -> unknown
-	don'tCare = q reqState >>= \case SRead 4 -> decodeTopState 4; SRead 8 -> decodeTopState 8; SRead _ -> don'tCare; _ -> unknown
-
-	reqState = QRead addrState
+stateThread :: (Request -> IO (IO Response)) -> IO a
+stateThread q = getState >>= new where
+	new st = print st >> go st
+	go st = do
+		st' <- getState
+		if st == st' then go st else new st'
+	
+	getState = do
+		mresps <- traverse (q . QRead) [addrState, addrNumPlayers, addrP1VirusesToAdd, addrP2VirusesToAdd]
+		[respState, respNumPlayers, respP1VirusesToAdd, respP2VirusesToAdd] <- sequence mresps
+		pure case respState of
+			SRead 8 -> case respP1VirusesToAdd of
+				SRead 0 -> case (respNumPlayers, respP2VirusesToAdd) of
+					(SRead 1, SRead _) -> Pregame
+					(SRead 2, SRead 0) -> Pregame
+					(SRead _, SRead _) -> Don'tCare
+					_ -> Unknown
+				SRead _ -> Don'tCare
+				_ -> Unknown
+			SRead 4 -> Play
+			SRead _ -> Don'tCare
+			_ -> Unknown
 
 expectedVersion :: Response
 expectedVersion = SVersion
@@ -171,3 +177,21 @@ addrClock = 0x43
 
 addrState :: Word16
 addrState = 0x46
+
+addrNumPlayers :: Word16
+addrNumPlayers = 0x727
+
+addrP1State :: Word16
+addrP1State = 0x300
+
+addrP2State :: Word16
+addrP2State = 0x380
+
+offsetVirusesToAdd :: Word16
+offsetVirusesToAdd = 0x28
+
+addrP1VirusesToAdd :: Word16
+addrP1VirusesToAdd = addrP1State + offsetVirusesToAdd
+
+addrP2VirusesToAdd :: Word16
+addrP2VirusesToAdd = addrP2State + offsetVirusesToAdd

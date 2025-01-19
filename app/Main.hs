@@ -122,7 +122,7 @@ topLoop q_ s_ = go Bootstrapping where
 			unless (v == expectedVersion) $ hPrintf stderr "WARNING: continuing despite unexpected version information %s\n" (show v)
 			SRead clk <- q (QRead addrClock)
 			go (Unknown (fromIntegral clk))
-		Unknown clk -> readState WaitingForVirusesOrFirstControl clk
+		Unknown clk -> readUIState WaitingForVirusesOrFirstControl clk
 
 		WaitingForVirusesOrFirstControl clk -> do
 			SRead n <- q (QRead addrP1VirusesToAdd)
@@ -140,11 +140,11 @@ topLoop q_ s_ = go Bootstrapping where
 			print spd
 			ppIO $ unsafeGenerateBoard boardWidth boardHeight \(Position x y) -> cs !! (boardWidth*(boardHeight-y-1) + x)
 			go $ k spd cs (clk+1)
-		HaveLevelBeforeUnknownState spd cs clk -> readState (WaitingForFirstControl spd cs) clk
+		HaveLevelBeforeUnknownState spd cs clk -> readUIState (WaitingForFirstControl spd cs) clk
 		WaitingForViruses clk -> q (QRead addrP1VirusesToAdd) >>= go . \case
 			SRead 0 -> ReadingLevel WaitingForFirstControl 0 [] (clk+1)
 			SRead _ -> WaitingForViruses (clk+1)
-		WaitingForFirstControl spd cs clk -> readState (WaitingForFirstControl spd cs) clk
+		WaitingForFirstControl spd cs clk -> readUIState (WaitingForFirstControl spd cs) clk
 
 		InLevel clk -> go $ ReadingLevel (\_ _ -> Unknown) 0 [] clk
 		Relax clk -> printf "relax %d\n" clk >> go (Sync Unknown clk)
@@ -154,8 +154,8 @@ topLoop q_ s_ = go Bootstrapping where
 			when (diff /= 1) (printf "Clock mismatch: %d vs. %d\n" (clk+1) clk')
 			go . f $ clk + fromIntegral diff
 
-	readState f clk_ = do
-		SRead st <- q (QRead addrState)
+	readUIState f clk_ = do
+		SRead st <- q (QRead addrUIState)
 		go case st of
 			8 -> f clk
 			4 -> InLevel clk
@@ -205,8 +205,8 @@ boardLength = fromIntegral (boardWidth * boardHeight)
 addrClock :: Word16
 addrClock = 0x43
 
-addrState :: Word16
-addrState = 0x46
+addrUIState :: Word16
+addrUIState = 0x46
 
 addrNumPlayers :: Word16
 addrNumPlayers = 0x727

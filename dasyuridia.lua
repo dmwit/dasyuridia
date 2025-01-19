@@ -274,6 +274,7 @@ if INJECTION_POINT == nil then
 	end
 else
 	memory.registerexec(INJECTION_POINT, function()
-		while poll_stdin() do parse_message(io.read()) end
+		-- pessimistically assume we can only handle one message per frame
+		if poll_stdin() then parse_message(io.read()) end
 	end)
 end

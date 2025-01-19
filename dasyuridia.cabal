@@ -15,8 +15,9 @@ data-files:         dasyuridia.lua
 executable dasyuridia
     main-is:            Main.hs
     other-modules:      Paths_dasyuridia
-    build-depends:      base ^>=4.19.0.0,
+    build-depends:      base ^>=4.16,
                         array ^>=0.5,
+                        maryodel ^>=0.1,
                         process ^>=1.6,
                         stm ^>=2.5,
     hs-source-dirs:     app

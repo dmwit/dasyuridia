@@ -1,9 +1,10 @@
 module Main where
 
 import Control.Concurrent
-import Control.Concurrent.STM
 import Control.Monad
+import Data.Bits
 import Data.Word
+import Dr.Mario.Model
 import Paths_dasyuridia
 import System.Environment
 import System.Exit
@@ -11,9 +12,6 @@ import System.IO
 import System.Process
 import Text.Printf
 import Text.Read
-
-import qualified Data.Array as A
-import qualified Data.Array.IO as MA
 
 main :: IO ()
 main = do
@@ -57,7 +55,8 @@ fceux args = do
 renderForFceux :: Handle -> Identified Request -> IO ()
 renderForFceux h ireq = hPrintf h "%d %s\n" (identity ireq) case value ireq of
 	QVersion -> "version"
-	QRead addr -> "read " ++ show addr
+	QRead addr -> printf "read %d" addr
+	QArrayRead size addr -> printf "array_read %d %d" size addr
 
 parseFromFceux :: Handle -> IO (Identified Response)
 parseFromFceux h = go where
@@ -71,6 +70,7 @@ parseFromFceux h = go where
 	pResponse n s = case break (' '==) s of
 		("version", ' ':rest) -> pVersion n rest
 		("read", ' ':(readMaybe -> Just val)) -> success n $ SRead val
+		("array_read", ' ':(traverse readMaybe . words -> Just vals)) -> success n $ SArrayRead vals
 		(responseTy, rest) -> complain $ printf "Ignoring response with unknown type %s from dasyuridia.lua, or with unknown format for this type: %s" responseTy rest
 	pVersion n s = case words s of
 		[readMaybe -> Just v, readMaybe -> Just ar, readMaybe -> Just aw, readMaybe -> Just fc]
@@ -87,82 +87,105 @@ data Identified a = Identified
 data Request
 	= QVersion
 	| QRead Word16
+	| QArrayRead Word8 Word16
 	deriving (Eq, Ord, Read, Show)
 data Response
 	= SVersion { protocolVersion, maxArrayReadSize, maxArrayWriteSize, maxFreezeCount :: Word8 }
 	| SRead Word8
+	| SArrayRead [Word8]
 	deriving (Eq, Ord, Read, Show)
 
-topLoop :: (Identified Request -> IO ()) -> IO (Identified Response) -> IO ()
-topLoop q s = do
-	q (Identified 42 QVersion)
-	v <- s
-	unless (v == Identified 42 expectedVersion) $ hPrintf stderr "WARNING: continuing despite unexpected version information %s\n" (show v)
-	rpc <- launchRPCThreads q s
-	let rpcSync = join . rpc
-	stateThread rpc
-
-launchRPCThreads :: (Identified Request -> IO ()) -> IO (Identified Response) -> IO (Request -> IO (IO Response))
-launchRPCThreads q s = do
-	chan <- newTChanIO
-	reservations <- MA.newGenArray @MA.IOArray (minBound, maxBound) (const newEmptyMVar) >>= MA.freeze
-	let reqLoop i = do
-	    	(req, mresp) <- atomically (readTChan chan)
-	    	success <- tryPutMVar (reservations A.! i) (putMVar mresp)
-	    	if success
-	    		then q (Identified i req)
-	    		else do
-	    			hPrintf stderr "Tried to reuse outstanding ID %d; perhaps the game has stopped responding? Will try again with another ID after waiting one frame.\n" i
-	    			atomically (unGetTChan chan (req, mresp))
-	    			threadDelay (1000000`quot`60)
-	    	reqLoop (i+1)
-	    respLoop = do
-	    	Identified i resp <- s
-	    	tryTakeMVar (reservations A.! i) >>= \case
-	    		Just act -> act resp
-	    		Nothing -> hPrintf stderr "Ignoring response with unexpected ID %d\n" i
-	    	respLoop
-	_ <- forkIO (reqLoop 0)
-	_ <- forkIO respLoop
-	return \req -> do
-		mresp <- newEmptyMVar
-		atomically (writeTChan chan (req, mresp))
-		return (takeMVar mresp)
-
-clockThread :: (Request -> IO Response) -> IO a
 -- 2 million years ought to be enough for anybody
-clockThread q = go (0 :: Word64) where
-	go clock = print clock >> q req >>= \case
-		SRead clock' -> go (clock + fromIntegral (clock' - fromIntegral clock))
-		resp -> do
-			hPrintf stderr "Ignoring unexpected response %s to request %s\n" (show resp) (show req)
-			go clock
-	req = QRead addrClock
+type FrameCount = Word64
+data State
+	= Bootstrapping
+	| Unknown FrameCount
+	| WaitingForVirusesOrFirstControl FrameCount
+	| ReadingLevel (CoarseSpeed -> [Cell] -> FrameCount -> State) Word16 [Cell] FrameCount
+	| HaveLevelBeforeUnknownState CoarseSpeed [Cell] FrameCount
+	| WaitingForViruses FrameCount
+	| WaitingForFirstControl CoarseSpeed [Cell] FrameCount
+	| InLevel FrameCount
+	| Relax FrameCount
+	| Sync (FrameCount -> State) FrameCount
 
-data State = Unknown | Err | Don'tCare | Pregame | Play deriving (Eq, Ord, Read, Show)
+topLoop :: (Identified Request -> IO ()) -> IO (Identified Response) -> IO ()
+topLoop q_ s_ = go Bootstrapping where
+	q req = do
+		q_ (Identified 0 req)
+		Identified 0 resp <- s_
+		pure resp
 
-stateThread :: (Request -> IO (IO Response)) -> IO a
-stateThread q = getState >>= new where
-	new st = print st >> go st
-	go st = do
-		st' <- getState
-		if st == st' then go st else new st'
-	
-	getState = do
-		mresps <- traverse (q . QRead) [addrState, addrNumPlayers, addrP1VirusesToAdd, addrP2VirusesToAdd]
-		[respState, respNumPlayers, respP1VirusesToAdd, respP2VirusesToAdd] <- sequence mresps
-		pure case respState of
-			SRead 8 -> case respP1VirusesToAdd of
-				SRead 0 -> case (respNumPlayers, respP2VirusesToAdd) of
-					(SRead 1, SRead _) -> Pregame
-					(SRead 2, SRead 0) -> Pregame
-					(SRead _, SRead _) -> Don'tCare
-					_ -> Unknown
-				SRead _ -> Don'tCare
-				_ -> Unknown
-			SRead 4 -> Play
-			SRead _ -> Don'tCare
-			_ -> Unknown
+	go = \case
+		Bootstrapping -> do
+			v <- q QVersion
+			unless (v == expectedVersion) $ hPrintf stderr "WARNING: continuing despite unexpected version information %s\n" (show v)
+			SRead clk <- q (QRead addrClock)
+			go (Unknown (fromIntegral clk))
+		Unknown clk -> readState WaitingForVirusesOrFirstControl clk
+
+		WaitingForVirusesOrFirstControl clk -> do
+			SRead n <- q (QRead addrP1VirusesToAdd)
+			go case n of
+				0 -> ReadingLevel HaveLevelBeforeUnknownState 0 [] (clk+1)
+				_ -> WaitingForViruses (clk+1)
+		ReadingLevel k len cs clk | len < boardLength -> do
+			SArrayRead ws <- q (QArrayRead (maxArrayReadSize expectedVersion) (addrP1Board + len))
+			cs' <- traverse decodeCell ws
+			-- assumes maxArrayReadSize divides boardLength
+			go $ ReadingLevel k (len+fromIntegral (maxArrayReadSize expectedVersion)) (cs ++ cs') (clk+1)
+		ReadingLevel k _len cs clk -> do
+			SRead w <- q (QRead addrP1CoarseSpeed)
+			spd <- decodeSpeed w
+			print spd
+			ppIO $ unsafeGenerateBoard boardWidth boardHeight \(Position x y) -> cs !! (boardWidth*(boardHeight-y-1) + x)
+			go $ k spd cs (clk+1)
+		HaveLevelBeforeUnknownState spd cs clk -> readState (WaitingForFirstControl spd cs) clk
+		WaitingForViruses clk -> q (QRead addrP1VirusesToAdd) >>= go . \case
+			SRead 0 -> ReadingLevel WaitingForFirstControl 0 [] (clk+1)
+			SRead _ -> WaitingForViruses (clk+1)
+		WaitingForFirstControl spd cs clk -> readState (WaitingForFirstControl spd cs) clk
+
+		InLevel clk -> go $ ReadingLevel (\_ _ -> Unknown) 0 [] clk
+		Relax clk -> printf "relax %d\n" clk >> go (Sync Unknown clk)
+		Sync f clk -> do
+			SRead clk' <- q (QRead addrClock)
+			let diff = clk' - fromIntegral clk
+			when (diff /= 1) (printf "Clock mismatch: %d vs. %d\n" (clk+1) clk')
+			go . f $ clk + fromIntegral diff
+
+	readState f clk_ = do
+		SRead st <- q (QRead addrState)
+		go case st of
+			8 -> f clk
+			4 -> InLevel clk
+			_ -> Relax clk
+		where clk = clk_ + 1
+
+decodeCell :: Word8 -> IO Cell
+decodeCell 0xff = pure Empty
+decodeCell w = do
+	color <- case w .&. 0x0f of
+		0 -> pure Yellow
+		1 -> pure Red
+		2 -> pure Blue
+		_ -> fail $ "failed to decode cell byte " ++ show w
+	case w `shiftR` 4 of
+		0x4 -> pure $ Occupied color North
+		0x5 -> pure $ Occupied color South
+		0x6 -> pure $ Occupied color West
+		0x7 -> pure $ Occupied color East
+		0x8 -> pure $ Occupied color Disconnected
+		0xb -> pure $ Empty -- clearing (don't know how it chooses between this and the 0xf case)
+		0xd -> pure $ Occupied color Virus
+		0xf -> pure $ Empty -- clearing
+		_ -> fail $ "failed to decode cell byte " ++ show w
+
+decodeSpeed :: Word8 -> IO CoarseSpeed
+decodeSpeed = \case
+	0 -> pure Low
+	1 -> pure Med
+	2 -> pure Hi
 
 expectedVersion :: Response
 expectedVersion = SVersion
@@ -171,6 +194,13 @@ expectedVersion = SVersion
 	, maxArrayWriteSize = 16
 	, maxFreezeCount = 5
 	}
+
+boardWidth, boardHeight :: Int
+boardWidth = 8
+boardHeight = 16
+
+boardLength :: Word16
+boardLength = fromIntegral (boardWidth * boardHeight)
 
 addrClock :: Word16
 addrClock = 0x43
@@ -181,17 +211,22 @@ addrState = 0x46
 addrNumPlayers :: Word16
 addrNumPlayers = 0x727
 
-addrP1State :: Word16
+addrP1State, addrP2State :: Word16
 addrP1State = 0x300
-
-addrP2State :: Word16
 addrP2State = 0x380
 
-offsetVirusesToAdd :: Word16
+offsetVirusesToAdd, addrP1VirusesToAdd, addrP2VirusesToAdd :: Word16
 offsetVirusesToAdd = 0x28
 
-addrP1VirusesToAdd :: Word16
-addrP1VirusesToAdd = addrP1State + offsetVirusesToAdd
+offsetCoarseSpeed, addrP1CoarseSpeed, addrP2CoarseSpeed :: Word16
+offsetCoarseSpeed = 0xb
 
-addrP2VirusesToAdd :: Word16
-addrP2VirusesToAdd = addrP2State + offsetVirusesToAdd
+offsetsPlayerState :: [Word16]
+offsetsPlayerState = [
+ 	offsetVirusesToAdd, offsetCoarseSpeed]
+[	addrP1VirusesToAdd, addrP1CoarseSpeed] = map (addrP1State+) offsetsPlayerState
+[	addrP2VirusesToAdd, addrP2CoarseSpeed] = map (addrP2State+) offsetsPlayerState
+
+addrP1Board, addrP2Board :: Word16
+addrP1Board = 0x400
+addrP2Board = 0x500

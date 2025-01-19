@@ -144,6 +144,7 @@ topLoop q_ s_ = go Bootstrapping where
 		WaitingForViruses clk -> q (QRead addrP1VirusesToAdd) >>= go . \case
 			SRead 0 -> ReadingLevel WaitingForFirstControl 0 [] (clk+1)
 			SRead _ -> WaitingForViruses (clk+1)
+			resp -> error $ "Unexpected response " ++ show resp ++ " to request " ++ show (QRead addrP1VirusesToAdd)
 		WaitingForFirstControl spd cs clk -> readUIState (WaitingForFirstControl spd cs) clk
 
 		InLevel clk -> go $ ReadingLevel (\_ _ -> Unknown) 0 [] clk
@@ -165,19 +166,19 @@ topLoop q_ s_ = go Bootstrapping where
 decodeCell :: Word8 -> IO Cell
 decodeCell 0xff = pure Empty
 decodeCell w = do
-	color <- case w .&. 0x0f of
+	c <- case w .&. 0x0f of
 		0 -> pure Yellow
 		1 -> pure Red
 		2 -> pure Blue
 		_ -> fail $ "failed to decode cell byte " ++ show w
 	case w `shiftR` 4 of
-		0x4 -> pure $ Occupied color North
-		0x5 -> pure $ Occupied color South
-		0x6 -> pure $ Occupied color West
-		0x7 -> pure $ Occupied color East
-		0x8 -> pure $ Occupied color Disconnected
+		0x4 -> pure $ Occupied c North
+		0x5 -> pure $ Occupied c South
+		0x6 -> pure $ Occupied c West
+		0x7 -> pure $ Occupied c East
+		0x8 -> pure $ Occupied c Disconnected
 		0xb -> pure $ Empty -- clearing (don't know how it chooses between this and the 0xf case)
-		0xd -> pure $ Occupied color Virus
+		0xd -> pure $ Occupied c Virus
 		0xf -> pure $ Empty -- clearing
 		_ -> fail $ "failed to decode cell byte " ++ show w
 
@@ -186,6 +187,7 @@ decodeSpeed = \case
 	0 -> pure Low
 	1 -> pure Med
 	2 -> pure Hi
+	w -> fail $ "failed to decode speed byte " ++ show w
 
 expectedVersion :: Response
 expectedVersion = SVersion

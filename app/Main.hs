@@ -187,6 +187,7 @@ topLoop q_ s_ = go Bootstrapping where
 				5 -> tick clk (ReadingLevel (\_ _ -> ThrowingOrControl) 0 [])
 				6 -> tick clk Throwing -- TODO: report next control
 				_ -> fail $ "unknown game state " ++ show st
+		-- TODO: notice when we've won the game and switch to Relax
 		Cleanup clk -> do
 			st <- qRead addrP1GameState
 			case st of

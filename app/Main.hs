@@ -125,12 +125,12 @@ topLoop q_ s_ = go Bootstrapping where
 		Bootstrapping -> do
 			v <- q QVersion
 			unless (v == expectedVersion) $ hPrintf stderr "WARNING: continuing despite unexpected version information %s\n" (show v)
-			SRead clk <- q (QRead addrClock)
+			clk <- qRead addrClock
 			go (Unknown (fromIntegral clk))
 		Unknown clk -> readUIState WaitingForVirusesOrFirstControl clk
 		Relax clk -> printf "relax %d\n" clk >> go (Sync Unknown clk)
 		Sync f clk -> do
-			SRead clk' <- q (QRead addrClock)
+			clk' <- qRead addrClock
 			let diff = clk' - fromIntegral clk
 			when (diff /= 1) (printf "Clock mismatch: %d vs. %d\n" (clk+1) clk')
 			go . f $ clk + fromIntegral diff
@@ -142,7 +142,7 @@ topLoop q_ s_ = go Bootstrapping where
 			-- assumes maxArrayReadSize divides boardLength
 			tick clk $ ReadingLevel k (len+fromIntegral (maxArrayReadSize expectedVersion)) (cs ++ cs')
 		ReadingLevel k _len cs clk -> do
-			SRead w <- q (QRead addrP1CoarseSpeed)
+			w <- qRead addrP1CoarseSpeed
 			spd <- decodeSpeed w
 			print spd
 			ppIO $ unsafeGenerateBoard boardWidth boardHeight \(Position x y) -> cs !! (boardWidth*(boardHeight-y-1) + x)
@@ -150,21 +150,20 @@ topLoop q_ s_ = go Bootstrapping where
 
 		-- level has just started, we haven't started controlling the first pill yet
 		WaitingForVirusesOrFirstControl clk -> do
-			SRead n <- q (QRead addrP1VirusesToAdd)
+			n <- qRead addrP1VirusesToAdd
 			tick clk case n of
 				0 -> ReadingLevel HaveLevelBeforeUnknownState 0 []
 				_ -> WaitingForViruses
 		HaveLevelBeforeUnknownState spd cs clk -> readUIState (WaitingForFirstControl spd cs) clk
-		WaitingForViruses clk -> q (QRead addrP1VirusesToAdd) >>= tick clk . \case
-			SRead 0 -> ReadingLevel WaitingForFirstControl 0 []
-			SRead _ -> WaitingForViruses
-			resp -> error $ "Unexpected response " ++ show resp ++ " to request " ++ show (QRead addrP1VirusesToAdd)
+		WaitingForViruses clk -> qRead addrP1VirusesToAdd >>= tick clk . \case
+			0 -> ReadingLevel WaitingForFirstControl 0 []
+			_ -> WaitingForViruses
 		WaitingForFirstControl spd cs clk -> readUIState (WaitingForFirstControl spd cs) clk
 
 		-- we are playing a level; the bulk of the time should be spent in these states
 		-- TODO: if we just started the emulator and are dropped into an InLevel state, we should report the board and pill status and whatever we know about control
 		InLevel clk -> do
-			SRead n <- q (QRead addrP1VirusCount)
+			n <- qRead addrP1VirusCount
 			tick clk case n of
 				0 -> Relax
 				_ -> NotWon
@@ -177,7 +176,7 @@ topLoop q_ s_ = go Bootstrapping where
 		-- 5 prethrow
 		-- 6 throw
 		NotWon clk -> do
-			SRead st <- q (QRead addrP1GameState)
+			st <- qRead addrP1GameState
 			case st of
 				0 -> tick clk NotWon
 				1 -> putStrLn ("lock " ++ show clk) >> tick clk Cleanup -- TODO: make a second report with the pill position/orientation before transitioning to cleanup
@@ -189,7 +188,7 @@ topLoop q_ s_ = go Bootstrapping where
 				6 -> tick clk Throwing -- TODO: report next control
 				_ -> fail $ "unknown game state " ++ show st
 		Cleanup clk -> do
-			SRead st <- q (QRead addrP1GameState)
+			st <- qRead addrP1GameState
 			case st of
 				0 -> tick clk Relax -- console reset
 				1 -> tick clk Cleanup
@@ -197,7 +196,7 @@ topLoop q_ s_ = go Bootstrapping where
 				2 -> putStrLn ("next control " ++ show (clk+25)) >> tick clk (ReadingLevel (\_ _ -> Throwing) 0 [])
 				_ -> fail $ "unexpected transition from cleanup game state to " ++ show st
 		Throwing clk -> do
-			SRead st <- q (QRead addrP1GameState)
+			st <- qRead addrP1GameState
 			case st of
 				000 -> tick clk Relax -- console reset, not Rev A
 				003 -> putStrLn ("next control " ++ show (clk+1))
@@ -210,11 +209,14 @@ topLoop q_ s_ = go Bootstrapping where
 
 	tick clk f = go (f (clk+1))
 	readUIState f clk = do
-		SRead st <- q (QRead addrUIState)
+		st <- qRead addrUIState
 		tick clk case st of
 			8 -> f
 			4 -> InLevel
 			_ -> Relax
+	qRead addr = q (QRead addr) >>= \case
+		SRead resp -> pure resp
+		resp -> fail $ "Unexpected response " ++ show resp ++ " to request " ++ show (QRead addr)
 
 decodeCell :: Word8 -> IO Cell
 decodeCell 0xff = pure Empty

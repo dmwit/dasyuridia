@@ -170,7 +170,7 @@ nesLoop qAsync sAsync env = do
 			[0, _] -> relax
 			[_, st] -> case st of
 				0 -> qByte addrUIState >>= \case 4 -> inLevel; _ -> unknown
-				1 -> readIORef clkRef >>= \clk -> report ("lock " ++ show (clk-1)) >> cleanup
+				1 -> readIORef clkRef >>= \clk -> report ("lock " ++ show (clk-1)) >> cleanupClk
 				2 -> beginPillToss gameState2TransitionPillTossDelay
 				3 -> beginControl
 				4 -> unknown
@@ -192,9 +192,16 @@ nesLoop qAsync sAsync env = do
 			clk <- readIORef clkRef
 			report ("next control " ++ show clk)
 			inLevel
-		cleanup = debug "cleanup" >> qByte addrP1GameState >>= \case
+
+		-- we ping-pong between syncing the frame counter and checking whether
+		-- we've won
+		cleanupClk = debug "cleanupClk" >> qByte addrP1GameState >>= cleanupDispatch cleanupWon
+		cleanupWon = debug "cleanupWon" >> qBytes addrP1VirusCount addrP1GameState >>= \case
+			[0, _] -> relax
+			[_, s] -> cleanupDispatch cleanupClk s
+		cleanupDispatch k = \case
 			0 -> relax -- console reset
-			1 -> cleanup
+			1 -> k
 			2 -> beginPillToss gameState2TransitionPillTossDelay
 			s -> fail $ "unexpected transition from cleanup game state to " ++ show s
 

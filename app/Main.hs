@@ -193,12 +193,15 @@ nesLoop qAsync sAsync env = do
 			report ("next control " ++ show clk)
 			inLevel
 
-		-- we ping-pong between syncing the frame counter and checking whether
-		-- we've won
+		-- we ping-pong between syncing the frame counter, checking whether
+		-- we've won, and checking for a reset
 		cleanupClk = debug "cleanupClk" >> qByte addrP1GameState >>= cleanupDispatch cleanupWon
 		cleanupWon = debug "cleanupWon" >> qBytes addrP1VirusCount addrP1GameState >>= \case
 			[0, _] -> relax
-			[_, s] -> cleanupDispatch cleanupClk s
+			[_, s] -> cleanupDispatch cleanupUI s
+		cleanupUI = debug "cleanupUI" >> qBytes addrUIState addrP1GameState >>= \case
+			[4, s] -> cleanupDispatch cleanupClk s
+			_ -> unknown
 		cleanupDispatch k = \case
 			0 -> relax -- console reset
 			1 -> k

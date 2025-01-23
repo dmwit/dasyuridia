@@ -58,57 +58,32 @@ fceux args env = do
 		hPrintf stderr "fceux err: %s\n" line
 	nesLoop (renderForFceux i) (parseFromFceux o) env
 
-renderForFceux :: Handle -> Identified Request -> IO ()
-renderForFceux h ireq = hPrintf h "%d %s\n" (identity ireq) case value ireq of
-	QVersion -> "version"
-	QRead addr -> printf "read %d" addr
-	QArrayRead size addr -> printf "array_read %d %d" size addr
-	QWrite addr val -> printf "write %d %d" addr val
-	QWriteRead waddr0 wval0 waddr1 wval1 raddr0 rsz0 raddr1 rsz1 -> printf "write_read %d %d %d %d %d %d %d %d"
-		       waddr0 wval0 waddr1 wval1 raddr0 rsz0 raddr1 rsz1
+renderForFceux :: Handle -> Request -> IO ()
+renderForFceux h req = hPutStrLn h . unwords $ tail [undefined
+	, renderWrite (write0 req)
+	, renderWrite (write1 req)
+	, renderRead (read0 req)
+	, renderRead (read1 req)
+	] where
+	renderWrite w = printf "%d %d" (wAddress w) (wValue w)
+	renderRead r = printf "%d %d" (rAddress r) (rSize r)
 
-parseFromFceux :: Handle -> IO (Identified Response)
+parseFromFceux :: Handle -> IO Response
 parseFromFceux h = go where
 	go = hGetLine h >>= \case
-		'd':'a':'s':'y':'u':'r':'i':'d':'i':'a':':':' ':line -> pIdentified line
+		'd':'a':'s':'y':'u':'r':'i':'d':'i':'a':':':line -> case traverse readMaybe (words line) of
+			Just ws -> pure ws
+			Nothing -> hPrintf stderr "WARNING: Ignoring malformed response %s from dasyuridia.lua\n" line
+			        >> go
 		line -> hPrintf stderr "fceux out: %s\n" line >> go
 
-	pIdentified s = case break (' '==) s of
-		(readMaybe -> Just n, ' ':rest) -> pResponse n rest
-		_ -> complain $ "Ignoring malformed response from dasyuridia.lua: " ++ s
-	pResponse n s = case break (' '==) s of
-		("version", ' ':rest) -> pVersion n rest
-		("read", ' ':(readMaybe -> Just val)) -> success n $ SRead val
-		("array_read", ' ':(traverse readMaybe . words -> Just vals)) -> success n $ SArrayRead vals
-		("write", "") -> success n SWrite
-		("write_read", ' ':(traverse readMaybe . words -> Just vals)) -> success n $ SWriteRead vals
-		(responseTy, rest) -> complain $ printf "Ignoring response with unknown type %s from dasyuridia.lua, or with unknown format for this type: %s" responseTy rest
-	pVersion n s = case words s of
-		[readMaybe -> Just v, readMaybe -> Just ar, readMaybe -> Just aw, readMaybe -> Just fc]
-			-> success n $ SVersion v ar aw fc
-		_ -> complain $ "Ignoring version response with malformed arguments: " ++ s
-
-	success n = pure . Identified n
-	complain s = hPutStrLn stderr s >> go
-
-data Identified a = Identified
-	{ identity :: Word8
-	, value :: a
+data Write = Write { wAddress :: Word16, wValue :: Word8 } deriving (Eq, Ord, Read, Show)
+data ArrayRead = ArrayRead { rAddress :: Word16, rSize :: Word8 } deriving (Eq, Ord, Read, Show)
+data Request = Request
+	{ write0, write1 :: Write
+	, read0, read1 :: ArrayRead
 	} deriving (Eq, Ord, Read, Show)
-data Request
-	= QVersion
-	| QRead Word16
-	| QArrayRead Word8 Word16
-	| QWrite Word16 Word8 -- can do multiple at once if that becomes useful, dunno the upper limit but should probably look into that before adding this feature
-	| QWriteRead Word16 Word8 Word16 Word8 Word16 Word8 Word16 Word8
-	deriving (Eq, Ord, Read, Show)
-data Response
-	= SVersion { protocolVersion, maxArrayReadSize, maxArrayWriteSize, maxFreezeCount :: Word8 }
-	| SRead Word8
-	| SArrayRead [Word8]
-	| SWrite
-	| SWriteRead [Word8]
-	deriving (Eq, Ord, Read, Show)
+type Response = [Word8]
 
 -- a million years ought to be enough for anybody
 type FrameCount = Int
@@ -118,9 +93,9 @@ data Environment = Environment
 	, aiChan :: Chan String
 	}
 
-nesLoop :: (Identified Request -> IO ()) -> IO (Identified Response) -> Environment -> IO ()
+nesLoop :: (Request -> IO ()) -> IO Response -> Environment -> IO ()
 nesLoop qAsync sAsync env = do
-	[clk] <- qSync noWrite0 0 noWrite1 1 addrClock 1 0 0
+	[clk] <- qSync noWrite0 noWrite1 (ArrayRead addrClock 1) noRead
 	clkRef <- newIORef (fi clk)
 	go clkRef
 	where
@@ -248,21 +223,12 @@ nesLoop qAsync sAsync env = do
 				(_, ctrls) <- readTVar (controlsRef env)
 				let (ctrl, ctrls') = popControl clk ctrls
 				ctrl <$ writeTVar (controlsRef env) (clk, ctrls')
-			maybe (qSync noWrite0 0) (qSync addrP1Input) ctrl noWrite1 0 raddr0 rsz0 raddr1 rsz1
+			qSync (maybe noWrite0 (Write addrP1Input) ctrl) noWrite1 (ArrayRead raddr0 rsz0) (ArrayRead raddr1 rsz1)
 		-- end clkRef scope
-
-	qSync waddr0 wval0 waddr1 wval1 raddr0 rsz0 raddr1 rsz1 =
-		qAsync (Identified 0 req) >>
-		sAsync >>= \case
-			Identified 0 (SWriteRead vals) -> pure vals
-			resp@(Identified _ (SWriteRead _)) -> fail $ "Unexpected identifier in response " ++ show resp ++ " to request " ++ show (Identified 0 req)
-			Identified _ resp' -> fail $ "Unexpected response " ++ show resp' ++ " to request " ++ show req
-		where
-		req = QWriteRead waddr0 wval0 waddr1 wval1 raddr0 rsz0 raddr1 rsz1
 
 	debug :: String -> IO ()
 	debug = const (pure ()) -- hPrintf stderr "DEBUG: %s\n"
-
+	qSync w0 w1 r0 r1 = qAsync (Request w0 w1 r0 r1) >> sAsync
 	uiState4TransitionPillTossDelay = 22
 	gameState2TransitionPillTossDelay = 24
 
@@ -291,14 +257,6 @@ decodeSpeed = \case
 	1 -> pure Med
 	2 -> pure Hi
 	w -> fail $ "failed to decode speed byte " ++ show w
-
-expectedVersion :: Response
-expectedVersion = SVersion
-	{ protocolVersion = 0
-	, maxArrayReadSize = 16
-	, maxArrayWriteSize = 16
-	, maxFreezeCount = 5
-	}
 
 aiLoop :: Environment -> IO a
 aiLoop env = do
@@ -420,9 +378,12 @@ controlNone = 0
 controlRight, controlLeft, controlDown, controlUp, controlStart, controlSelect, controlA, controlB :: Word8
 controlRight: controlLeft: controlDown: controlUp: controlStart: controlSelect: controlB: controlA :_ = iterate (`shiftL` 1) 1
 
-noWrite0, noWrite1 :: Word16
-noWrite0 = 0xfffe
-noWrite1 = 0xffff
+noWrite0, noWrite1 :: Write
+noWrite0 = Write 0xfffe 0
+noWrite1 = Write 0xffff 0
+
+noRead :: ArrayRead
+noRead = ArrayRead 0 0
 
 addrClock :: Word16
 addrClock = 0x43

@@ -5,6 +5,7 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad
 import Data.Bits
+import Data.IORef
 import Data.List
 import Data.Word
 import Dr.Mario.Model
@@ -63,6 +64,8 @@ renderForFceux h ireq = hPrintf h "%d %s\n" (identity ireq) case value ireq of
 	QRead addr -> printf "read %d" addr
 	QArrayRead size addr -> printf "array_read %d %d" size addr
 	QWrite addr val -> printf "write %d %d" addr val
+	QWriteRead waddr0 wval0 waddr1 wval1 raddr0 rsz0 raddr1 rsz1 -> printf "write_read %d %d %d %d %d %d %d %d"
+		       waddr0 wval0 waddr1 wval1 raddr0 rsz0 raddr1 rsz1
 
 parseFromFceux :: Handle -> IO (Identified Response)
 parseFromFceux h = go where
@@ -78,6 +81,7 @@ parseFromFceux h = go where
 		("read", ' ':(readMaybe -> Just val)) -> success n $ SRead val
 		("array_read", ' ':(traverse readMaybe . words -> Just vals)) -> success n $ SArrayRead vals
 		("write", "") -> success n SWrite
+		("write_read", ' ':(traverse readMaybe . words -> Just vals)) -> success n $ SWriteRead vals
 		(responseTy, rest) -> complain $ printf "Ignoring response with unknown type %s from dasyuridia.lua, or with unknown format for this type: %s" responseTy rest
 	pVersion n s = case words s of
 		[readMaybe -> Just v, readMaybe -> Just ar, readMaybe -> Just aw, readMaybe -> Just fc]
@@ -96,99 +100,89 @@ data Request
 	| QRead Word16
 	| QArrayRead Word8 Word16
 	| QWrite Word16 Word8 -- can do multiple at once if that becomes useful, dunno the upper limit but should probably look into that before adding this feature
+	| QWriteRead Word16 Word8 Word16 Word8 Word16 Word8 Word16 Word8
 	deriving (Eq, Ord, Read, Show)
 data Response
 	= SVersion { protocolVersion, maxArrayReadSize, maxArrayWriteSize, maxFreezeCount :: Word8 }
 	| SRead Word8
 	| SArrayRead [Word8]
 	| SWrite
+	| SWriteRead [Word8]
 	deriving (Eq, Ord, Read, Show)
 
 -- a million years ought to be enough for anybody
 type FrameCount = Int
-data State
-	= Unknown
-	| WaitingForVirusesOrFirstControl
-	| ReadingLevel (CoarseSpeed -> [Cell] -> State) Int [Cell]
-	| HaveLevelBeforeUnknownState CoarseSpeed [Cell]
-	| WaitingForViruses
-	| WaitingForFirstControl CoarseSpeed [Cell]
-	| InLevel
-	| NotWon
-	| Cleanup
-	| Throwing
-	| ThrowingOrControl
-	| Relax
-	| Sync State
-
 newtype Controls = Controls { graphControls :: [(FrameCount, Word8)] } deriving (Eq, Ord, Read, Show)
-
 data Environment = Environment
 	{ controlsRef :: TVar (FrameCount, Controls)
 	, aiChan :: Chan String
 	}
 
--- TODO: sending a control one frame before the pill is ready leads to a relax that shouldn't happen
 nesLoop :: (Identified Request -> IO ()) -> IO (Identified Response) -> Environment -> IO ()
-nesLoop q_ s_ env = do
-	v <- q QVersion
-	unless (v == expectedVersion) $ hPrintf stderr "WARNING: continuing despite unexpected version information %s\n" (show v)
-	clk <- qRead addrClock
-	checkControls (fi clk) Unknown
+nesLoop qAsync sAsync env = do
+	[clk] <- qSync noWrite0 0 noWrite1 1 addrClock 1 0 0
+	clkRef <- newIORef (fi clk)
+	go clkRef
 	where
-	checkControls clk st = do
-		ctrl <- atomically do
-			(_, ctrls) <- readTVar (controlsRef env)
-			let (ctrl, ctrls') = popControl clk ctrls
-			ctrl <$ writeTVar (controlsRef env) (clk, ctrls')
-		case ctrl of
-			Nothing -> go clk st
-			Just w -> do
-				SWrite <- q (QWrite addrP1Input w)
-				checkControls (clk+1) Unknown
+	reportLevel spdw rowsw = do
+		spd <- decodeSpeed spdw
+		rows <- traverse (traverse decodeCell) rowsw
+		report (show spd)
+		report . pp $ unsafeGenerateBoard boardWidth boardHeight \pos -> rows !! y pos !! x pos
+	report = writeChan (aiChan env)
 
-	go clk = \case
-		-- miscellaneous
-		Unknown -> readUIState clk WaitingForVirusesOrFirstControl
-		Relax -> report (printf "relax %d" clk) >> go clk (Sync Unknown)
-		Sync st -> do
-			clk' <- qRead addrClock
-			let diff = clk' - fi clk
-			when (diff /= 1) (hPrintf stderr "WARNING: Clock mismatch: %d vs. %d\n" (clk+1) clk')
-			checkControls (clk + fi diff) st
-
-		-- some event just fired that makes now a good time to read the board state
-		ReadingLevel k len cs | len < boardLength -> do
-			SArrayRead ws <- q (QArrayRead (maxArrayReadSize expectedVersion) (addrP1Board + fi len))
-			cs' <- traverse decodeCell ws
-			-- assumes maxArrayReadSize divides boardLength
-			tick clk $ ReadingLevel k (len+fi (maxArrayReadSize expectedVersion)) (cs ++ cs')
-		ReadingLevel k _len cs -> do
-			w <- qRead addrP1CoarseSpeed
-			spd <- decodeSpeed w
-			report (show spd)
-			report . pp $ unsafeGenerateBoard boardWidth boardHeight \(Position x y) -> cs !! (boardWidth*(boardHeight-y-1) + x)
-			tick clk $ k spd cs
+	-- TODO: when opening the emulator to an inLevel state, it would be nice to
+	-- get an initial readout of the level situation
+	go clkRef = unknown where
+		-- miscellaneous states
+		unknown = debug "unknown" >> qByte addrUIState >>= \case
+			8 -> waitingForVirusesOrFirstControl
+			4 -> inLevel
+			_ -> relax
+		relax = debug "relax" >> readIORef clkRef >>= report . printf "relax %d" >> unknown
 
 		-- level has just started, we haven't started controlling the first pill yet
-		WaitingForVirusesOrFirstControl -> do
-			n <- qRead addrP1VirusesToAdd
-			tick clk case n of
-				0 -> ReadingLevel HaveLevelBeforeUnknownState 0 []
-				_ -> WaitingForViruses
-		HaveLevelBeforeUnknownState spd cs -> readUIState clk (WaitingForFirstControl spd cs)
-		WaitingForViruses -> qRead addrP1VirusesToAdd >>= tick clk . \case
-			0 -> ReadingLevel WaitingForFirstControl 0 []
-			_ -> WaitingForViruses
-		WaitingForFirstControl spd cs -> readUIState clk (WaitingForFirstControl spd cs)
+		waitingForVirusesOrFirstControl = debug "waitingForVirusesOrFirstControl" >> do
+			n:row <- q addrP1VirusesToAdd 1 addrP1Board (fi boardWidth)
+			case n of
+				0 -> readingLevelWaitingForFirstControl boardWidth [row] -- TODO: add an intermediate state to report when control is available next
+				_ -> waitingForViruses
+		readingLevelWaitingForFirstControl len rows = debug "readingLevelWaitingForFirstControl" >>
+			if len < boardLength
+			then do
+				st:row <- q addrUIState 1 (addrP1Board + fi len) (fi boardWidth)
+				case st of
+					8 -> readingLevelWaitingForFirstControl (len+boardWidth) (row:rows)
+					-- TODO: no, next control is about 25 frames away
+					4 -> readIORef clkRef >>= report . printf "control %d" >> readingLevelInLevel (len+boardWidth) (row:rows)
+					_ -> relax
+			else do
+				[st, spdw] <- qBytes addrUIState addrP1CoarseSpeed
+				reportLevel spdw rows
+				case st of
+					8 -> waitingForFirstControl
+					4 -> beginPillToss uiState4TransitionPillTossDelay
+					_ -> relax
+		waitingForViruses = debug "waitingForViruses" >> qByte addrP1VirusesToAdd >>= \case
+			0 -> readLevel >> waitingForFirstControl
+			_ -> waitingForViruses
+		waitingForFirstControl = debug "waitingForFirstControl" >> qByte addrUIState >>= \case
+			8 -> waitingForFirstControl
+			4 -> beginPillToss uiState4TransitionPillTossDelay
+			_ -> relax
+
+		-- uncomfortable limbo: we've just started with the first pill of the
+		-- level, but haven't finished reading the game state yet, so we're sort of
+		-- in the previous group and sort of in the next group
+		readingLevelInLevel len rows = debug "readingLevelInLevel" >> do
+			-- TODO: we can advance our knowledge of the game state more cleverly
+			-- than this using the other half of each request
+			rows' <- traverse (\offset -> qClk (addrP1Board + fi offset) (fi boardWidth)) [len, len+boardWidth .. boardLength-1]
+			spdw <- qByte addrP1CoarseSpeed
+			reportLevel spdw (reverse rows' ++ rows)
+			inLevel
 
 		-- we are playing a level; the bulk of the time should be spent in these states
-		-- TODO: if we just started the emulator and are dropped into an InLevel state, we should report the board and pill status and whatever we know about control
-		InLevel -> do
-			n <- qRead addrP1VirusCount
-			tick clk case n of
-				0 -> Relax
-				_ -> NotWon
 		-- game states:
 		-- 0 control
 		-- 1 cleanup
@@ -197,55 +191,80 @@ nesLoop q_ s_ env = do
 		-- 4 impossible
 		-- 5 prethrow
 		-- 6 throw
-		NotWon -> do
-			st <- qRead addrP1GameState
-			case st of
-				0 -> tick clk NotWon
-				1 -> report ("lock " ++ show clk) >> tick clk Cleanup -- TODO: make a second report with the pill position/orientation before transitioning to cleanup
-				-- TODO: handle Low speed correctly
-				2 -> report ("next control " ++ show (clk+25)) >> tick clk (ReadingLevel (\_ _ -> Throwing) 0 [])
-				3 -> report ("next control " ++ show (clk+1)) >> tick clk NotWon
-				4 -> tick clk Unknown
-				5 -> tick clk (ReadingLevel (\_ _ -> ThrowingOrControl) 0 [])
-				6 -> tick clk Throwing -- TODO: report next control
+		inLevel = debug "inLevel" >> qBytes addrP1VirusCount addrP1GameState >>= \case
+			[0, _] -> relax
+			[_, st] -> case st of
+				0 -> qByte addrUIState >>= \case 4 -> inLevel; _ -> unknown
+				1 -> readIORef clkRef >>= \clk -> report ("lock " ++ show (clk-1)) >> cleanup
+				2 -> beginPillToss gameState2TransitionPillTossDelay
+				3 -> beginControl
+				4 -> unknown
+				5 -> readLevel >> throwing
+				6 -> throwing
 				_ -> fail $ "unknown game state " ++ show st
-		-- TODO: notice when we've won the game and switch to Relax
-		Cleanup -> do
-			st <- qRead addrP1GameState
-			case st of
-				0 -> tick clk Relax -- console reset
-				1 -> tick clk Cleanup
-				-- TODO: handle Low speed correctly
-				2 -> report ("next control " ++ show (clk+25)) >> tick clk (ReadingLevel (\_ _ -> Throwing) 0 [])
-				_ -> fail $ "unexpected transition from cleanup game state to " ++ show st
-		Throwing -> do
-			st <- qRead addrP1GameState
-			case st of
-				000 -> tick clk Relax -- console reset, not Rev A
-				003 -> report ("next control " ++ show (clk+1))
-				    >> tick clk Unknown -- finished throwing; could do something fancy here to get the right next state, but why bother?
-				006 -> tick clk Throwing
-				255 -> tick clk Relax -- console reset, Rev A
-				_   -> hPutStrLn stderr ("WARNING: unexpected transition from throwing to " ++ show st)
-				    >> tick clk Unknown -- probably a console reset?
-		ThrowingOrControl -> go clk Unknown -- TODO: check whether we're still throwing; if we are, report when the next control phase is, and if not, report the current pill situation and that control is happening now
+		beginPillToss delay = debug (printf "beginPillToss %d" delay) >> do
+			clk <- readIORef clkRef
+			report ("next control " ++ show (clk+delay))
+			readLevel
+			throwing
+		throwing = debug "throwing" >> qByte addrP1GameState >>= \case
+			000 -> relax -- console reset, not Rev A
+			003 -> beginControl
+			006 -> throwing
+			255 -> relax -- console reset, Rev A
+			st  -> hPutStrLn stderr ("WARNING: unexpected transition from throwing to " ++ show st) >> unknown
+		beginControl = debug "beginControl" >> do
+			clk <- readIORef clkRef
+			report ("next control " ++ show clk)
+			inLevel
+		cleanup = debug "cleanup" >> qByte addrP1GameState >>= \case
+			0 -> relax -- console reset
+			1 -> cleanup
+			2 -> beginPillToss gameState2TransitionPillTossDelay
+			s -> fail $ "unexpected transition from cleanup game state to " ++ show s
 
-	report = writeChan (aiChan env)
-	tick clk = checkControls (clk+1)
-	readUIState clk st = do
-		wst <- qRead addrUIState
-		tick clk case wst of
-			8 -> st
-			4 -> InLevel
-			_ -> Relax
+		-- helpers
+		readLevel = debug "readLevel" >> do
+			doubleRows <- traverse (\offset -> q (addrP1Board + fi offset) (2*fi boardWidth) 0 0) [0,2*boardWidth..boardLength-1]
+			spdw <- qByte addrP1CoarseSpeed
+			let splitDoubleRow dr = let (row, row') = splitAt boardWidth dr in [row, row']
+			reportLevel spdw $ reverse (doubleRows >>= splitDoubleRow)
 
-	q req = do
-		q_ (Identified 0 req)
-		Identified 0 resp <- s_
-		pure resp
-	qRead addr = q (QRead addr) >>= \case
-		SRead resp -> pure resp
-		resp -> fail $ "Unexpected response " ++ show resp ++ " to request " ++ show (QRead addr)
+		-- requests
+		qByte addr = do
+			[val] <- qClk addr 1
+			pure val
+		qBytes addr0 addr1 = q addr0 1 addr1 1
+		qClk addr sz = do
+			clkw:rest <- q addrClock 1 addr sz
+			clk <- readIORef clkRef
+			let diff = clkw - fi clk
+			when (diff /= 0) (hPrintf stderr "WARNING: Clock mismatch: predicted %d (%d) vs. actual %d\n" clk (clk .&. 0xff) clkw)
+			rest <$ writeIORef clkRef (clk + fi diff)
+		q raddr0 rsz0 raddr1 rsz1 = do
+			clk <- readIORef clkRef
+			writeIORef clkRef (clk+1)
+			ctrl <- atomically do
+				(_, ctrls) <- readTVar (controlsRef env)
+				let (ctrl, ctrls') = popControl clk ctrls
+				ctrl <$ writeTVar (controlsRef env) (clk, ctrls')
+			maybe (qSync noWrite0 0) (qSync addrP1Input) ctrl noWrite1 0 raddr0 rsz0 raddr1 rsz1
+		-- end clkRef scope
+
+	qSync waddr0 wval0 waddr1 wval1 raddr0 rsz0 raddr1 rsz1 =
+		qAsync (Identified 0 req) >>
+		sAsync >>= \case
+			Identified 0 (SWriteRead vals) -> pure vals
+			resp@(Identified _ (SWriteRead _)) -> fail $ "Unexpected identifier in response " ++ show resp ++ " to request " ++ show (Identified 0 req)
+			Identified _ resp' -> fail $ "Unexpected response " ++ show resp' ++ " to request " ++ show req
+		where
+		req = QWriteRead waddr0 wval0 waddr1 wval1 raddr0 rsz0 raddr1 rsz1
+
+	debug :: String -> IO ()
+	debug = const (pure ()) -- hPrintf stderr "DEBUG: %s\n"
+
+	uiState4TransitionPillTossDelay = 22
+	gameState2TransitionPillTossDelay = 24
 
 decodeCell :: Word8 -> IO Cell
 decodeCell 0xff = pure Empty
@@ -400,6 +419,10 @@ controlNone = 0
 
 controlRight, controlLeft, controlDown, controlUp, controlStart, controlSelect, controlA, controlB :: Word8
 controlRight: controlLeft: controlDown: controlUp: controlStart: controlSelect: controlB: controlA :_ = iterate (`shiftL` 1) 1
+
+noWrite0, noWrite1 :: Word16
+noWrite0 = 0xfffe
+noWrite1 = 0xffff
 
 addrClock :: Word16
 addrClock = 0x43

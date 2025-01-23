@@ -235,6 +235,30 @@ local function exec_freeze()
 	end
 end
 
+local function exec_write_read(msg_id, args)
+	local waddr0, wval0, waddr1, wval1, raddr0, rsz0, raddr1, rsz1 =
+		args:match('^(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)$')
+	if waddr0 == nil then
+		io.write('ERR: malformed arguments in write_read: "' .. args .. '"\n')
+		return
+	end
+	waddr0, wval0, waddr1, wval1, raddr0, rsz0, raddr1, rsz1 = tonumber(waddr0), tonumber(wval0), tonumber(waddr1), tonumber(wval1), tonumber(raddr0), tonumber(rsz0), tonumber(raddr1), tonumber(rsz1)
+	if rsz0 + rsz1 > MAX_ARRAY_READ_SIZE then
+		local msg = "WARNING: read size may cause missed deadlines; recommended combined size of reads is %d, but saw %d + %d = %d\n"
+		io.write(msg:format(MAX_ARRAY_READ_SIZE, rsz0, rsz1, rsz0+rsz1))
+	end
+	if waddr0 ~= 0xfffe then memory.writebyte(waddr0, wval0) end
+	if waddr1 ~= 0xffff then memory.writebyte(waddr1, wval1) end
+	local read_result = ""
+	for i=1,rsz0 do
+		read_result = read_result .. ' ' .. memory.readbyte(raddr0+i-1)
+	end
+	for i=1,rsz1 do
+		read_result = read_result .. ' ' .. memory.readbyte(raddr1+i-1)
+	end
+	reply(msg_id, 'write_read', read_result:sub(2))
+end
+
 local action_table =
 	{ read=exec_read
 	, array_read=exec_array_read
@@ -243,6 +267,7 @@ local action_table =
 	, null=exec_null
 	, version=exec_version
 	, freeze=schedule_freeze
+	, write_read=exec_write_read
 	}
 
 local function parse_message(line)

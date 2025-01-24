@@ -36,7 +36,7 @@ usage h exitCode = do
 		, "USAGE: " ++ nm ++ " (--fceux [ARGS]) | --help | -h"
 		, ""
 		, "This is a tool for interacting with an implementation of NES Dr. Mario that"
-		, "supports the Crowd Control communication protocol. The CC protocol is game"
+		, "supports a custom communication protocol. The comms protocol is game"
 		, "agnostic; this tool bakes in knowledge about Dr. Mario to ease interaction."
 		, "It prints information about the current game state on stdout, and accepts"
 		, "commands on stdin. The exact format is not yet documented. Whoops."

@@ -100,10 +100,9 @@ nesLoop qAsync sAsync env = do
 	clkRef <- newIORef (fi clk)
 	go clkRef
 	where
-	-- TODO: machine-friendly reporting
 	reportBoard rowsw = do
 		rows <- traverse (traverse decodeCell) rowsw
-		report . pp $ unsafeGenerateBoard boardWidth boardHeight \pos -> rows !! y pos !! x pos
+		report ("board " ++ map ppCell (concat rows))
 	reportLookahead csw = do
 		[c0, c1] <- traverse decodeColor csw
 		report (printf "lookahead %s%s" (ppColor c0) (ppColor c1))
@@ -296,6 +295,10 @@ decodeColor = \case
 	1 -> pure Red
 	2 -> pure Blue
 	w -> fail $ "failed to decode color " ++ show w
+
+ppCell :: Cell -> Char
+ppCell Empty = 'd'
+ppCell (Occupied c s) = toEnum (0x60 .|. (1 + fromEnum c) .|. (shiftL (fromEnum s) 2))
 
 ppColor :: Color -> String
 ppColor = \case

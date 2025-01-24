@@ -5,10 +5,11 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad
 import Data.Bits
+import Data.Char
 import Data.IORef
 import Data.List
 import Data.Word
-import Dr.Mario.Model
+import Dr.Mario.Model hiding (decodeColor)
 import Paths_dasyuridia
 import System.Environment
 import System.Exit
@@ -99,11 +100,14 @@ nesLoop qAsync sAsync env = do
 	clkRef <- newIORef (fi clk)
 	go clkRef
 	where
-	reportLevel spdw rowsw = do
-		spd <- decodeSpeed spdw
+	-- TODO: machine-friendly reporting
+	reportBoard rowsw = do
 		rows <- traverse (traverse decodeCell) rowsw
-		report (show spd)
 		report . pp $ unsafeGenerateBoard boardWidth boardHeight \pos -> rows !! y pos !! x pos
+	reportLookahead csw = do
+		[c0, c1] <- traverse decodeColor csw
+		report (printf "lookahead %s%s" (ppColor c0) (ppColor c1))
+	reportSpeed = report . ("speed "++) . map toLower . show <=< decodeSpeed
 	report = writeChan (aiChan env)
 
 	-- TODO: when opening the emulator to an inLevel state, it would be nice to
@@ -120,7 +124,7 @@ nesLoop qAsync sAsync env = do
 		waitingForVirusesOrFirstControl = debug "waitingForVirusesOrFirstControl" >> do
 			n:row <- q addrP1VirusesToAdd 1 addrP1Board (fi boardWidth)
 			case n of
-				0 -> readingLevelWaitingForFirstControl boardWidth [row] -- TODO: add an intermediate state to report when control is available next
+				0 -> readingLevelWaitingForFirstControl boardWidth [row]
 				_ -> waitingForViruses
 		readingLevelWaitingForFirstControl len rows = debug "readingLevelWaitingForFirstControl" >>
 			if len < boardLength
@@ -128,15 +132,27 @@ nesLoop qAsync sAsync env = do
 				st:row <- q addrUIState 1 (addrP1Board + fi len) (fi boardWidth)
 				case st of
 					8 -> readingLevelWaitingForFirstControl (len+boardWidth) (row:rows)
-					-- TODO: no, next control is about 25 frames away
-					4 -> readIORef clkRef >>= report . printf "control %d" >> readingLevelInLevel (len+boardWidth) (row:rows)
+					4 -> do
+						clk <- readIORef clkRef
+						report (printf "next control %d" (clk+uiState4TransitionPillTossDelay))
+						-- TODO: we could cram the readLookahead and readSpeed
+						-- queries into the other half of the board requests
+						rows' <- traverse (\offset -> qClk (addrP1Board + fi offset) (fi boardWidth)) [len+boardWidth, len+2*boardWidth .. boardLength-1]
+						reportBoard (reverse rows' ++ row:rows)
+						readLookahead
+						readSpeed
+						inLevel
 					_ -> relax
 			else do
-				[st, spdw] <- qBytes addrUIState addrP1CoarseSpeed
-				reportLevel spdw rows
-				case st of
-					8 -> waitingForFirstControl
-					4 -> beginPillToss uiState4TransitionPillTossDelay
+				reportBoard rows
+				st0:lk <- q addrUIState 1 addrP1Lookahead 2
+				reportLookahead lk
+				[st1, spdw] <- qBytes addrUIState addrP1CoarseSpeed
+				reportSpeed spdw
+				case (st0, st1) of
+					(4, _) -> beginPillToss (uiState4TransitionPillTossDelay-1)
+					(_, 4) -> beginPillToss uiState4TransitionPillTossDelay
+					(_, 8) -> waitingForFirstControl
 					_ -> relax
 		waitingForViruses = debug "waitingForViruses" >> qByte addrP1VirusesToAdd >>= \case
 			0 -> readLevel >> waitingForFirstControl
@@ -145,17 +161,6 @@ nesLoop qAsync sAsync env = do
 			8 -> waitingForFirstControl
 			4 -> beginPillToss uiState4TransitionPillTossDelay
 			_ -> relax
-
-		-- uncomfortable limbo: we've just started with the first pill of the
-		-- level, but haven't finished reading the game state yet, so we're sort of
-		-- in the previous group and sort of in the next group
-		readingLevelInLevel len rows = debug "readingLevelInLevel" >> do
-			-- TODO: we can advance our knowledge of the game state more cleverly
-			-- than this using the other half of each request
-			rows' <- traverse (\offset -> qClk (addrP1Board + fi offset) (fi boardWidth)) [len, len+boardWidth .. boardLength-1]
-			spdw <- qByte addrP1CoarseSpeed
-			reportLevel spdw (reverse rows' ++ rows)
-			inLevel
 
 		-- we are playing a level; the bulk of the time should be spent in these states
 		-- game states:
@@ -166,35 +171,54 @@ nesLoop qAsync sAsync env = do
 		-- 4 impossible
 		-- 5 prethrow
 		-- 6 throw
+
+		-- in normal flow, inLevel means we're in the control phase, but we can
+		-- also get dumped here in an unknown phase at emulator startup
 		inLevel = debug "inLevel" >> qBytes addrP1VirusCount addrP1GameState >>= \case
 			[0, _] -> relax
 			[_, st] -> case st of
 				0 -> qByte addrUIState >>= \case 4 -> inLevel; _ -> unknown
-				1 -> readIORef clkRef >>= \clk -> report ("lock " ++ show (clk-1)) >> cleanupClk
+				1 -> do
+					-- we have 8 frames until we need to be watching for the
+					-- next pill toss
+					clk <- readIORef clkRef
+					-- direction is number of counterclockwise rotations
+					d:csw <- q addrP1PillDirection 1 addrP1PillColors 2
+					let orientation = if d .&. 1 == 0 then "horizontal" else "vertical"
+					[x, y] <- qClk addrP1PillPosition 2
+					cs <- (if d > 1 then reverse else id) <$> traverse decodeColor csw
+					report (printf "lock %d %s %s (%d, %d)" (clk-1) orientation (cs >>= ppColor) x y)
+					cleanup
 				2 -> beginPillToss gameState2TransitionPillTossDelay
 				3 -> beginControl
-				4 -> unknown
+				4 -> hPutStrLn stderr "WARNING: entered game state 4, which should be impossible" >> unknown
 				5 -> readLevel >> throwing
-				6 -> throwing
+				6 -> readLevel >> throwing
 				_ -> fail $ "unknown game state " ++ show st
 		beginPillToss delay = debug (printf "beginPillToss %d" delay) >> do
 			clk <- readIORef clkRef
 			report ("next control " ++ show (clk+delay))
 			readLevel
 			throwing
+		-- TODO: this does not notice an (ab*#) reset
 		throwing = debug "throwing" >> qByte addrP1GameState >>= \case
 			000 -> relax -- console reset, not Rev A
 			003 -> beginControl
+			004 -> relax -- lost, now in UI state 5 (see 0x9ba7)
 			006 -> throwing
 			255 -> relax -- console reset, Rev A
 			st  -> hPutStrLn stderr ("WARNING: unexpected transition from throwing to " ++ show st) >> unknown
+		-- we only ever enter this state when we know for sure that this is the
+		-- first frame of control
 		beginControl = debug "beginControl" >> do
 			clk <- readIORef clkRef
-			report ("next control " ++ show clk)
+			report ("control " ++ show clk)
+			readLookahead
 			inLevel
 
 		-- we ping-pong between syncing the frame counter, checking whether
 		-- we've won, and checking for a reset
+		cleanup = cleanupClk
 		cleanupClk = debug "cleanupClk" >> qByte addrP1GameState >>= cleanupDispatch cleanupWon
 		cleanupWon = debug "cleanupWon" >> qBytes addrP1VirusCount addrP1GameState >>= \case
 			[0, _] -> relax
@@ -204,16 +228,21 @@ nesLoop qAsync sAsync env = do
 			_ -> unknown
 		cleanupDispatch k = \case
 			0 -> relax -- console reset
-			1 -> k
+			1 -> k -- cycle to the next thing to check, but stay in cleanup mode
 			2 -> beginPillToss gameState2TransitionPillTossDelay
 			s -> fail $ "unexpected transition from cleanup game state to " ++ show s
 
 		-- helpers
-		readLevel = debug "readLevel" >> do
+		readBoard = debug "readBoard" >> do
 			doubleRows <- traverse (\offset -> q (addrP1Board + fi offset) (2*fi boardWidth) 0 0) [0,2*boardWidth..boardLength-1]
-			spdw <- qByte addrP1CoarseSpeed
 			let splitDoubleRow dr = let (row, row') = splitAt boardWidth dr in [row, row']
-			reportLevel spdw $ reverse (doubleRows >>= splitDoubleRow)
+			reportBoard (reverse (doubleRows >>= splitDoubleRow))
+		readLookahead = debug "readLookahead" >> qClk addrP1Lookahead 2 >>= reportLookahead
+		readSpeed = debug "readSpeed" >> qByte addrP1CoarseSpeed >>= reportSpeed
+		readLevel = debug "readLevel" >> readBoard >> readLookahead >> readSpeed
+
+		debug :: String -> IO ()
+		debug msg = pure () -- -} readIORef clkRef >>= \clk -> hPrintf stderr "DEBUG (frame %d): %s\n" clk msg
 
 		-- requests
 		qByte addr = do
@@ -235,9 +264,6 @@ nesLoop qAsync sAsync env = do
 				ctrl <$ writeTVar (controlsRef env) (clk, ctrls')
 			qSync (maybe noWrite0 (Write addrP1Input) ctrl) noWrite1 (ArrayRead raddr0 rsz0) (ArrayRead raddr1 rsz1)
 		-- end clkRef scope
-
-	debug :: String -> IO ()
-	debug = const (pure ()) -- hPrintf stderr "DEBUG: %s\n"
 	qSync w0 w1 r0 r1 = qAsync (Request w0 w1 r0 r1) >> sAsync
 	uiState4TransitionPillTossDelay = 22
 	gameState2TransitionPillTossDelay = 24
@@ -245,20 +271,16 @@ nesLoop qAsync sAsync env = do
 decodeCell :: Word8 -> IO Cell
 decodeCell 0xff = pure Empty
 decodeCell w = do
-	c <- case w .&. 0x0f of
-		0 -> pure Yellow
-		1 -> pure Red
-		2 -> pure Blue
-		_ -> fail $ "failed to decode cell byte " ++ show w
+	occ <- (pure .) . Occupied <$> decodeColor (w .&. 0x0f)
 	case w `shiftR` 4 of
-		0x4 -> pure $ Occupied c North
-		0x5 -> pure $ Occupied c South
-		0x6 -> pure $ Occupied c West
-		0x7 -> pure $ Occupied c East
-		0x8 -> pure $ Occupied c Disconnected
-		0xb -> pure $ Empty -- clearing (don't know how it chooses between this and the 0xf case)
-		0xd -> pure $ Occupied c Virus
-		0xf -> pure $ Empty -- clearing
+		0x4 -> occ North
+		0x5 -> occ South
+		0x6 -> occ West
+		0x7 -> occ East
+		0x8 -> occ Disconnected
+		0xb -> pure Empty -- clearing (don't know how it chooses between this and the 0xf case)
+		0xd -> occ Virus
+		0xf -> pure Empty -- clearing
 		_ -> fail $ "failed to decode cell byte " ++ show w
 
 decodeSpeed :: Word8 -> IO CoarseSpeed
@@ -267,6 +289,19 @@ decodeSpeed = \case
 	1 -> pure Med
 	2 -> pure Hi
 	w -> fail $ "failed to decode speed byte " ++ show w
+
+decodeColor :: Word8 -> IO Color
+decodeColor = \case
+	0 -> pure Yellow
+	1 -> pure Red
+	2 -> pure Blue
+	w -> fail $ "failed to decode color " ++ show w
+
+ppColor :: Color -> String
+ppColor = \case
+	Blue -> "b"
+	Red -> "r"
+	Yellow -> "y"
 
 aiLoop :: Environment -> IO a
 aiLoop env = do
@@ -420,11 +455,23 @@ offsetGameState = 0x17
 offsetVirusCount, addrP1VirusCount, addrP2VirusCount :: Word16
 offsetVirusCount = 0x24
 
+offsetLookahead, addrP1Lookahead, addrP2Lookahead :: Word16
+offsetLookahead = 0x1a
+
+offsetPillPosition, addrP1PillPosition, addrP2PillPosition :: Word16
+offsetPillPosition = 0x5
+
+offsetPillDirection, addrP1PillDirection, addrP2PillDirection :: Word16
+offsetPillDirection = 0x25
+
+offsetPillColors, addrP1PillColors, addrP2PillColors :: Word16
+offsetPillColors = 0x1
+
 offsetsPlayerState :: [Word16]
 offsetsPlayerState = [
- 	offsetVirusesToAdd, offsetCoarseSpeed, offsetGameState, offsetVirusCount]
-[	addrP1VirusesToAdd, addrP1CoarseSpeed, addrP1GameState, addrP1VirusCount] = map (addrP1State+) offsetsPlayerState
-[	addrP2VirusesToAdd, addrP2CoarseSpeed, addrP2GameState, addrP2VirusCount] = map (addrP2State+) offsetsPlayerState
+ 	offsetVirusesToAdd, offsetCoarseSpeed, offsetGameState, offsetVirusCount, offsetLookahead, offsetPillPosition, offsetPillDirection, offsetPillColors]
+[	addrP1VirusesToAdd, addrP1CoarseSpeed, addrP1GameState, addrP1VirusCount, addrP1Lookahead, addrP1PillPosition, addrP1PillDirection, addrP1PillColors] = map (addrP1State+) offsetsPlayerState
+[	addrP2VirusesToAdd, addrP2CoarseSpeed, addrP2GameState, addrP2VirusCount, addrP2Lookahead, addrP2PillPosition, addrP2PillDirection, addrP2PillColors] = map (addrP2State+) offsetsPlayerState
 
 addrP1Board, addrP2Board :: Word16
 addrP1Board = 0x400

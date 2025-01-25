@@ -327,7 +327,7 @@ aiLoop env = do
 						else Nothing <$ writeTVar (controlsRef env) (clk, ctrlsNext)
 				writeChan (aiChan env) case problem of
 					Nothing -> "accepted"
-					Just clk | clk == minBound -> "unprepared"
+					Just clk | clk == minBound+1 -> "unprepared"
 					         | otherwise -> printf "rejected %d" clk
 
 -- a number, a space, a control sequence, and an optional q

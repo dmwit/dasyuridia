@@ -5,7 +5,7 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad
 import Data.Bits
-import Data.Char
+import Data.Char (toLower)
 import Data.IORef
 import Data.List
 import Data.Word
@@ -59,17 +59,22 @@ fceux args env = do
 		hPrintf stderr "fceux err: %s\n" line
 	nesLoop (renderForFceux i) (parseFromFceux o) env
 
-renderForFceux :: Handle -> Request -> IO ()
-renderForFceux h req = hPutStrLn h . unwords $ tail [undefined
-	, renderWrite (write0 req)
-	, renderWrite (write1 req)
-	, renderRead (read0 req)
-	, renderRead (read1 req)
-	] where
+renderForFceux :: Handle -> NESRequest -> IO ()
+renderForFceux h req = hPutStrLn h case req of
+	NESUnpause -> "unpause"
+	NESPause wr -> "pause " ++ renderWriteRead wr
+	NESNormal wr -> renderWriteRead wr
+	where
+	renderWriteRead wr = unwords $ tail [undefined
+		, renderWrite (write0 wr)
+		, renderWrite (write1 wr)
+		, renderRead (read0 wr)
+		, renderRead (read1 wr)
+		]
 	renderWrite w = printf "%d %d" (wAddress w) (wValue w)
 	renderRead r = printf "%d %d" (rAddress r) (rSize r)
 
-parseFromFceux :: Handle -> IO Response
+parseFromFceux :: Handle -> IO NESResponse
 parseFromFceux h = go where
 	go = hGetLine h >>= \case
 		'd':'a':'s':'y':'u':'r':'i':'d':'i':'a':':':line -> case traverse readMaybe (words line) of
@@ -80,23 +85,33 @@ parseFromFceux h = go where
 
 data Write = Write { wAddress :: Word16, wValue :: Word8 } deriving (Eq, Ord, Read, Show)
 data ArrayRead = ArrayRead { rAddress :: Word16, rSize :: Word8 } deriving (Eq, Ord, Read, Show)
-data Request = Request
+data WriteRead = WriteRead
 	{ write0, write1 :: Write
 	, read0, read1 :: ArrayRead
 	} deriving (Eq, Ord, Read, Show)
-type Response = [Word8]
+data NESRequest
+	= NESNormal WriteRead
+	| NESPause WriteRead
+	| NESUnpause
+	deriving (Eq, Ord, Read, Show)
+type NESResponse = [Word8]
 
 -- a million years ought to be enough for anybody
 type FrameCount = Int
 newtype Controls = Controls { graphControls :: [(FrameCount, Word8)] } deriving (Eq, Ord, Read, Show)
+data ThreadComms = ThreadComms
+	{ currentFrame :: FrameCount
+	, controlRequests :: Controls
+	, paused :: Bool
+	} deriving (Eq, Ord, Read, Show)
 data Environment = Environment
-	{ controlsRef :: TVar (FrameCount, Controls)
+	{ commsRef :: TVar ThreadComms
 	, aiChan :: Chan String
 	}
 
-nesLoop :: (Request -> IO ()) -> IO Response -> Environment -> IO ()
+nesLoop :: (NESRequest -> IO ()) -> IO NESResponse -> Environment -> IO ()
 nesLoop qAsync sAsync env = do
-	[clk] <- qSync noWrite0 noWrite1 (ArrayRead addrClock 1) noRead
+	[clk] <- qSync False noWrite0 noWrite1 (ArrayRead addrClock 1) noRead
 	clkRef <- newIORef (fi clk)
 	go clkRef
 	where
@@ -257,13 +272,19 @@ nesLoop qAsync sAsync env = do
 		q raddr0 rsz0 raddr1 rsz1 = do
 			clk <- readIORef clkRef
 			writeIORef clkRef (clk+1)
-			ctrl <- atomically do
-				(_, ctrls) <- readTVar (controlsRef env)
-				let (ctrl, ctrls') = popControl clk ctrls
-				ctrl <$ writeTVar (controlsRef env) (clk, ctrls')
-			qSync (maybe noWrite0 (Write addrP1Input) ctrl) noWrite1 (ArrayRead raddr0 rsz0) (ArrayRead raddr1 rsz1)
+			(reqPause, ctrl) <- atomically do
+				comms <- readTVar (commsRef env)
+				let (ctrl, ctrls') = popControl clk (controlRequests comms)
+				(paused comms, ctrl) <$ writeTVar (commsRef env) comms { currentFrame = clk, controlRequests = ctrls' }
+			resp <- qSync reqPause (maybe noWrite0 (Write addrP1Input) ctrl) noWrite1 (ArrayRead raddr0 rsz0) (ArrayRead raddr1 rsz1)
+			when reqPause do
+				atomically $ readTVar (commsRef env) >>= \case
+					ThreadComms { paused = False } -> pure ()
+					_ -> retry
+				qAsync NESUnpause
+			pure resp
 		-- end clkRef scope
-	qSync w0 w1 r0 r1 = qAsync (Request w0 w1 r0 r1) >> sAsync
+	qSync pause w0 w1 r0 r1 = qAsync ((if pause then NESPause else NESNormal) (WriteRead w0 w1 r0 r1)) >> sAsync
 	uiState4TransitionPillTossDelay = 22
 	gameState2TransitionPillTossDelay = 24
 
@@ -313,33 +334,49 @@ aiLoop env = do
 	_ <- forkIO . forever $ readChan (aiChan env) >>= putStrLn
 	forever do
 		s <- getLine
-		case parseControlRequest s of
+		case parseAIRequest s of
 			Nothing -> writeChan (aiChan env) "malformed"
-			Just (clk', ctrls', infty) -> do
+			Just (Debug cmd) -> atomically $ modifyTVar (commsRef env) \comms -> comms { paused = cmd == AIPause }
+			Just (Control clk' ctrls' infty) -> do
 				problem <- atomically do
-					(clk, ctrls) <- readTVar (controlsRef env)
+					comms@ThreadComms { currentFrame = clk, controlRequests = ctrls } <- readTVar (commsRef env)
 					let ctrlsNext = if infty
 					    	then ctrls `mergeControlsUntil` pushControls clk' ctrls' emptyControls
 					    	else pushControls clk' ctrls' ctrls
 					-- minBound check ensures nesLoop has started
 					if clk+1 > clk' || clk == minBound
 						then pure (Just (clk+1))
-						else Nothing <$ writeTVar (controlsRef env) (clk, ctrlsNext)
+						else Nothing <$ writeTVar (commsRef env) comms { controlRequests = ctrlsNext }
 				writeChan (aiChan env) case problem of
 					Nothing -> "accepted"
 					Just clk | clk == minBound+1 -> "unprepared"
 					         | otherwise -> printf "rejected %d" clk
 
+data AIRequest
+	= Debug DebugRequest
+	| Control FrameCount [Maybe Word8] Bool
+
+data DebugRequest = AIPause | AIUnpause deriving (Bounded, Enum, Eq, Ord, Read, Show)
+
+parseAIRequest :: String -> Maybe AIRequest
+parseAIRequest s = parseControlRequest s <|> parseDebugRequest s
+
+parseDebugRequest :: String -> Maybe AIRequest
+parseDebugRequest = \case
+	"pause" -> Just (Debug AIPause)
+	"unpause" -> Just (Debug AIUnpause)
+	_ -> Nothing
+
 -- a number, a space, a control sequence, and an optional q
 -- control sequence: many repetitions of a single control
 -- control: - for do not override, e for press no buttons, a single button (see singleButton), or parentheses with any number of buttons inside (including 0 or 1)
-parseControlRequest :: String -> Maybe (FrameCount, [Maybe Word8], Bool)
+parseControlRequest :: String -> Maybe AIRequest
 parseControlRequest s = case reads s of
 	[(clk, ' ':s')] -> go [] s'
 		where
 		go ws = \case
-			[] -> Just (clk, reverse ws, False)
-			"q" -> Just (clk, reverse ws, True)
+			[] -> success ws False
+			"q" -> success ws True
 			c:cs -> case singleButton c of
 				w@Just{} -> go (w:ws) cs
 				Nothing -> case c of
@@ -364,6 +401,8 @@ parseControlRequest s = case reads s of
 			[] -> Nothing
 			')':cs -> Just (w, cs)
 			c:cs -> singleButton c >>= \w' -> multiButton (w .|. w') cs
+
+		success ws b = Just (Control clk (reverse ws) b)
 	_ -> Nothing
 
 emptyControls :: Controls
@@ -396,9 +435,14 @@ earlierThan :: FrameCount -> (FrameCount, Word8) -> Bool
 earlierThan clk (clk', _) = clk' < clk
 
 newEnvironment :: IO Environment
-newEnvironment = liftA2 Environment
-	(newTVarIO (minBound, emptyControls))
-	newChan
+newEnvironment = pure Environment <*> newTVarIO newThreadComms <*> newChan
+
+newThreadComms :: ThreadComms
+newThreadComms = ThreadComms
+	{ currentFrame = minBound
+	, controlRequests = emptyControls
+	, paused = False
+	}
 
 {-# inline fi #-}
 fi :: (Integral a, Num b) => a -> b

@@ -1,6 +1,6 @@
 local MAX_ARRAY_READ_SIZE = 16
 
-local function parse_message(line)
+local function write_read(line)
 	local waddr0, wval0, waddr1, wval1, raddr0, rsz0, raddr1, rsz1 =
 		line:match('^(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)$')
 	if waddr0 == nil then
@@ -23,6 +23,18 @@ local function parse_message(line)
 	end
 	io.write('\n')
 	io.flush()
+end
+
+local function pause(args)
+	if args ~= "" then write_read(args) end
+	emu.pause()
+	io.read()
+	emu.unpause()
+end
+
+local function parse_message(line)
+	local pause_args = line:match('^pause%s?(.*)$')
+	if pause_args == nil then write_read(line) else pause(pause_args) end
 end
 
 local poll_stdin = require("poll_stdin")

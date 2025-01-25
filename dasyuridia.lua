@@ -4,7 +4,7 @@ local function parse_message(line)
 	local waddr0, wval0, waddr1, wval1, raddr0, rsz0, raddr1, rsz1 =
 		line:match('^(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)%s(%d+)$')
 	if waddr0 == nil then
-		io.write('ERR: malformed arguments request: "' .. line .. '"\n')
+		io.write('ERR: malformed arguments in request: "' .. line .. '"\n')
 		return
 	end
 	waddr0, wval0, waddr1, wval1, raddr0, rsz0, raddr1, rsz1 = tonumber(waddr0), tonumber(wval0), tonumber(waddr1), tonumber(wval1), tonumber(raddr0), tonumber(rsz0), tonumber(raddr1), tonumber(rsz1)

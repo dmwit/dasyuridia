@@ -17,6 +17,8 @@ executable dasyuridia
     other-modules:      Paths_dasyuridia
     build-depends:      base ^>=4.16,
                         array ^>=0.5,
+                        bytestring ^>=0.11,
+                        j0 ^>=0.1,
                         maryodel ^>=0.1,
                         process ^>=1.6,
                         stm ^>=2.5,

@@ -1,3 +1,6 @@
 [submodule "maryodel"]
 	path = maryodel
 	url = https://github.com/dmwit/maryodel
+[submodule "j0"]
+	path = j0
+	url = https://github.com/dmwit/j0

@@ -13,10 +13,14 @@ import Dr.Mario.Model hiding (decodeColor)
 import Paths_dasyuridia
 import System.Environment
 import System.Exit
+import System.Hardware.N8Pro
 import System.IO
 import System.Process
 import Text.Printf
 import Text.Read
+
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as BS
 
 main :: IO ()
 main = do
@@ -25,6 +29,7 @@ main = do
 	_ <- forkIO (aiLoop env)
 	case args of
 		"--fceux":fceuxArgs -> fceux fceuxArgs env
+		["--everdrive", dev] -> everdrive dev env
 		["--help"] -> usage stdout ExitSuccess
 		["-h"] -> usage stdout ExitSuccess
 		_ -> usage stderr (ExitFailure 1)
@@ -33,7 +38,7 @@ usage :: Handle -> ExitCode -> IO a
 usage h exitCode = do
 	nm <- getProgName
 	hPutStr h . unlines $ drop 1 [undefined
-		, "USAGE: " ++ nm ++ " (--fceux [ARGS]) | --help | -h"
+		, "USAGE: " ++ nm ++ " (--fceux [ARGS]) | (--everdrive FILE) | --help | -h"
 		, ""
 		, "This is a tool for interacting with an implementation of NES Dr. Mario that"
 		, "supports a custom communication protocol. The comms protocol is game"
@@ -43,6 +48,8 @@ usage h exitCode = do
 		, ""
 		, "    --fceux       Launch and communicate with fceux, passing any extra ARGS"
 		, "                  along verbatim"
+		, "    --everdrive   Communicate with an Everdrive N8 Pro via the given com"
+		, "                  port (e.g. /dev/ttyACM0)"
 		, "    --help, -h    Print this message"
 		]
 	exitWith exitCode
@@ -83,6 +90,45 @@ parseFromFceux h = go where
 			        >> go
 		line -> hPrintf stderr "fceux out: %s\n" line >> go
 
+everdrive :: FilePath -> Environment -> IO ()
+everdrive dev env = do
+	wrs <- newIORef mempty
+	h <- openPort dev
+	hCommand h GetStatus >>= \case
+		Left err -> fail $ "Could not get EverDrive status: " ++ show err
+		Right ExitSuccess -> pure ()
+		Right other -> fail $ "Bad EverDrive status: " ++ show other
+	hCommand h GetMode >>= \case
+		Left err -> fail $ "Could not get EverDrive mode: " ++ show err
+		Right Application -> pure ()
+		Right Service -> fail $ "EverDrive still in service mode (perhaps the NES isn't on yet?)"
+	nesLoop (renderForEverdrive h wrs) (parseFromEverdrive h wrs) env
+
+renderForEverdrive :: Handle -> IORef (Q WriteRead) -> NESRequest -> IO ()
+renderForEverdrive h wrs = \case
+	NESUnpause -> hPutStrLn stderr "Pause/unpause not supported by EverDrive backend"
+	NESPause wr -> hPutStrLn stderr "Pause/unpause not supported by EverDrive backend" >> go wr
+	NESNormal wr -> go wr
+	where
+	go wr = do
+		modifyIORef wrs (pushQ wr)
+		result <- hCommand h . WriteMemory addrFIFO . BS.toStrict . BS.toLazyByteString $ n8Encode wr
+		case result of
+			Left err -> fail $ "Error when writing to EverDrive FIFO: " ++ show err
+			Right () -> pure ()
+
+parseFromEverdrive :: Handle -> IORef (Q WriteRead) -> IO NESResponse
+parseFromEverdrive h wrsRef = do
+	wrs <- readIORef wrsRef
+	case popQ wrs of
+		Nothing -> fail $ "tried to read more responses than there have been requests"
+		Just (wrs', wr) -> do
+			writeIORef wrsRef wrs'
+			let len0 = fi (rSize (read0 wr)); len1 = fi (rSize (read1 wr))
+			bs <- BS.hGet h (len0 + len1)
+			return $  (BS.unpack . BS.reverse . BS.take len0) bs
+			       ++ (BS.unpack . BS.reverse . BS.drop len0) bs
+
 data Write = Write { wAddress :: Word16, wValue :: Word8 } deriving (Eq, Ord, Read, Show)
 data ArrayRead = ArrayRead { rAddress :: Word16, rSize :: Word8 } deriving (Eq, Ord, Read, Show)
 data WriteRead = WriteRead
@@ -108,6 +154,8 @@ data Environment = Environment
 	{ commsRef :: TVar ThreadComms
 	, aiChan :: Chan String
 	}
+
+type Q a = ([a], [a])
 
 nesLoop :: (NESRequest -> IO ()) -> IO NESResponse -> Environment -> IO ()
 nesLoop qAsync sAsync env = do
@@ -443,6 +491,21 @@ newThreadComms = ThreadComms
 	, controlRequests = emptyControls
 	, paused = False
 	}
+
+instance N8Encode Write where n8Encode = (n8Encode . wAddress) <> (n8Encode . wValue)
+instance N8Encode ArrayRead where n8Encode = (n8Encode . rAddress) <> (n8Encode . rSize)
+instance N8Encode WriteRead where
+	n8Encode = (n8Encode . write0) <> (n8Encode . read0) <> (n8Encode . write1) <> (n8Encode . read1)
+
+pushQ :: a -> Q a -> Q a
+pushQ a (front, back) = (front, a:back)
+
+popQ :: Q a -> Maybe (Q a, a)
+popQ (front, back) = case front of
+	a:as -> Just ((as, back), a)
+	[] -> case reverse back of
+		a:as -> Just ((as, []), a)
+		[] -> Nothing
 
 {-# inline fi #-}
 fi :: (Integral a, Num b) => a -> b

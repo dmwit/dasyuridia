@@ -403,6 +403,7 @@ aiLoop env = do
 data AIRequest
 	= Debug DebugRequest
 	| Control FrameCount [Maybe Word8] Bool
+	deriving (Eq, Ord, Read, Show)
 
 data DebugRequest = AIPause | AIUnpause deriving (Bounded, Enum, Eq, Ord, Read, Show)
 

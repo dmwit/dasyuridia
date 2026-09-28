@@ -3,11 +3,14 @@ module Main where
 import Control.Applicative
 import Control.Concurrent
 import Control.Concurrent.STM
+import Control.Exception
 import Control.Monad
 import Data.Bits
 import Data.Char (toLower)
+import Data.Foldable
 import Data.IORef
 import Data.List
+import Data.Typeable
 import Data.Word
 import Dr.Mario.Model hiding (decodeColor)
 import Paths_dasyuridia
@@ -15,6 +18,7 @@ import System.Environment
 import System.Exit
 import System.Hardware.N8Pro
 import System.IO
+import System.Posix.Signals
 import System.Process
 import Text.Printf
 import Text.Read
@@ -57,14 +61,14 @@ usage h exitCode = do
 fceux :: [String] -> Environment -> IO ()
 fceux args env = do
 	script <- getDataFileName "dasyuridia.lua"
-	(i, o, e, _p) <- runInteractiveProcess "fceux" ("--loadlua":script:args) Nothing Nothing
+	(i, o, e, p) <- runInteractiveProcess "fceux" ("--loadlua":script:args) Nothing Nothing
 	hSetBuffering i LineBuffering
 	hSetBuffering o LineBuffering
 	hSetBuffering e LineBuffering
 	_ <- forkIO . forever $ do
 		line <- hGetLine e
 		hPrintf stderr "fceux err: %s\n" line
-	nesLoop (renderForFceux i) (parseFromFceux o) env
+	nesLoop (renderForFceux i) (parseFromFceux o) env `catch` \Finished -> killFceux p
 
 renderForFceux :: Handle -> NESRequest -> IO ()
 renderForFceux h req = hPutStrLn h case req of
@@ -129,6 +133,27 @@ parseFromEverdrive h wrsRef = do
 			return $  (BS.unpack . BS.reverse . BS.take len0) bs
 			       ++ (BS.unpack . BS.reverse . BS.drop len0) bs
 
+-- What I wish I could do, and why it isn't good enough, in preference order:
+--
+-- 1. `hClose i` and have that Just Work the way good Unix programs do. But no,
+--    fceux believes it is a GUI, not a Unix program.
+-- 2. `hClose i`, have the lua script detect this, and call `emu.exit()`. But
+--    due to an fceux bug, when you call `emu.exit()`... the emu does not exit.
+-- 3. `terminateProcess p >> waitForProcess p`. But no, probably due to the
+--    same bug, sending SIGTERM to fceux does not make fceux TERM.
+-- 4. `signalProcess sigKILL p >> waitForProcess p`. But no, then fceux doesn't
+--    get to do its shutdown code and things get messed up.
+--
+-- So we make a race condition because I'm not making a thing that calls
+-- emu.exit() and then reports that it's done so back to dasyuridia and having
+-- that just completely break when fceux gets its act together.
+killFceux :: ProcessHandle -> IO ()
+killFceux p = do
+	terminateProcess p
+	threadDelay 1_000_000
+	getPid p >>= traverse_ (signalProcess sigKILL)
+	() <$ waitForProcess p
+
 data Write = Write { wAddress :: Word16, wValue :: Word8 } deriving (Eq, Ord, Read, Show)
 data ArrayRead = ArrayRead { rAddress :: Word16, rSize :: Word8 } deriving (Eq, Ord, Read, Show)
 data WriteRead = WriteRead
@@ -149,11 +174,14 @@ data ThreadComms = ThreadComms
 	{ currentFrame :: FrameCount
 	, controlRequests :: Controls
 	, paused :: Bool
+	, expiration :: FrameCount
 	} deriving (Eq, Ord, Read, Show)
 data Environment = Environment
 	{ commsRef :: TVar ThreadComms
 	, aiChan :: Chan String
 	}
+data Finished = Finished deriving (Bounded, Enum, Eq, Ord, Read, Show, Typeable)
+instance Exception Finished
 
 type Q a = ([a], [a])
 
@@ -320,10 +348,11 @@ nesLoop qAsync sAsync env = do
 		q raddr0 rsz0 raddr1 rsz1 = do
 			clk <- readIORef clkRef
 			writeIORef clkRef (clk+1)
-			(reqPause, ctrl) <- atomically do
+			(expired, reqPause, ctrl) <- atomically do
 				comms <- readTVar (commsRef env)
 				let (ctrl, ctrls') = popControl clk (controlRequests comms)
-				(paused comms, ctrl) <$ writeTVar (commsRef env) comms { currentFrame = clk, controlRequests = ctrls' }
+				(clk >= expiration comms, paused comms, ctrl) <$ writeTVar (commsRef env) comms { currentFrame = clk, controlRequests = ctrls' }
+			when expired (throwIO Finished)
 			resp <- qSync reqPause (maybe noWrite0 (Write addrP1Input) ctrl) noWrite1 (ArrayRead raddr0 rsz0) (ArrayRead raddr1 rsz1)
 			when reqPause do
 				atomically $ readTVar (commsRef env) >>= \case
@@ -384,7 +413,10 @@ aiLoop env = do
 		s <- getLine
 		case parseAIRequest s of
 			Nothing -> writeChan (aiChan env) "malformed"
-			Just (Debug cmd) -> atomically $ modifyTVar (commsRef env) \comms -> comms { paused = cmd == AIPause }
+			Just (Debug cmd) -> atomically $ modifyTVar (commsRef env) \comms -> case cmd of
+				AIPause -> comms { paused = True }
+				AIUnpause -> comms { paused = False }
+				AIQuit frame -> comms { expiration = min frame (expiration comms) }
 			Just (Control clk' ctrls' infty) -> do
 				problem <- atomically do
 					comms@ThreadComms { currentFrame = clk, controlRequests = ctrls } <- readTVar (commsRef env)
@@ -405,7 +437,7 @@ data AIRequest
 	| Control FrameCount [Maybe Word8] Bool
 	deriving (Eq, Ord, Read, Show)
 
-data DebugRequest = AIPause | AIUnpause deriving (Bounded, Enum, Eq, Ord, Read, Show)
+data DebugRequest = AIPause | AIUnpause | AIQuit FrameCount deriving (Eq, Ord, Read, Show)
 
 parseAIRequest :: String -> Maybe AIRequest
 parseAIRequest s = parseControlRequest s <|> parseDebugRequest s
@@ -414,7 +446,10 @@ parseDebugRequest :: String -> Maybe AIRequest
 parseDebugRequest = \case
 	"pause" -> Just (Debug AIPause)
 	"unpause" -> Just (Debug AIUnpause)
-	_ -> Nothing
+	"quit" -> Just (Debug (AIQuit minBound))
+	other -> do
+		("quit ", frame) <- pure $ splitAt 5 other
+		Debug . AIQuit <$> readMaybe frame
 
 -- a number, a space, a control sequence, and an optional q
 -- control sequence: many repetitions of a single control
@@ -491,6 +526,7 @@ newThreadComms = ThreadComms
 	{ currentFrame = minBound
 	, controlRequests = emptyControls
 	, paused = False
+	, expiration = maxBound
 	}
 
 instance N8Encode Write where n8Encode = (n8Encode . wAddress) <> (n8Encode . wValue)
